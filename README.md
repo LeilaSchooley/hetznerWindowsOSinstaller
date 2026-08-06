@@ -81,8 +81,8 @@ No files to download to your PC. No SCP. No uploads. Just one SSH command.
 - **Stable disk IDs** — Resume stores `/dev/disk/by-id` so `sda`/`sdb` letter swaps cannot retarget disks
 - **Equal-size guard** — Refuses ambiguous auto-select when top disks are the same size
 - **VirtIO boot-start** — Registers `viostor`/`vioscsi` in the offline SYSTEM hive (Cloud-safe)
-- **UEFI on Cloud** — Requires UEFI for KVM unless `--bios` is passed explicitly
-- **Hardened Legacy BIOS** — GRUB `ntldr /bootmgr` primary path + ms-sys VBR; refuses incomplete boot chains
+- **UEFI preferred / Legacy guaranteed** — Auto-uses UEFI when firmware is EFI; on Legacy Cloud, installs GRUB `ntldr` on **both** instance + Volume disks so BIOS disk-0 order cannot miss Windows
+- **Legacy preflight** — Requires `grub-install` + `hivexsh` before wiping disks; verifies bootmgr/BCD/GRUB/MBR before reboot
 - **RDP Pre-configured** — Remote Desktop enabled and firewall rules applied on first boot
 - **Built-in Network Repair** — `C:\fix-network.cmd` auto-placed on Windows drive for KVM use
 - **Unattended Install** — Full OOBE bypass, auto-login for setup, and post-install hardening
@@ -166,7 +166,7 @@ bash install-windows.sh --dry-run
 
 - Attach a **Volume** as workspace (ISO download). The installer picks the **largest** disk for Windows and the **second-largest** for work — never by `sda`/`sdb` letter order.
 - VirtIO storage + network drivers are injected and registered boot-start on KVM/Cloud (`viostor` + `NetKVM` required).
-- **UEFI is required** on Cloud/KVM (enable in Cloud Console). Pass `--bios` only if you knowingly need Legacy BIOS — BIOS installs use a hardened GRUB→`bootmgr` path, but UEFI is still preferred.
+- **UEFI preferred** in Cloud Console when available. If rescue shows Legacy/CSM, the installer auto-enables the guaranteed GRUB→`bootmgr` path (no `--bios` flag needed) and also puts GRUB on the Volume so firmware disk-0 still finds Windows.
 - If the two largest disks are the same size, pass `--target-disk` / `--work-disk` (prefer `/dev/disk/by-id/...`).
 
 ### Command-Line Options

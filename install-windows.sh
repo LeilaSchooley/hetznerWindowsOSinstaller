@@ -51,7 +51,9 @@
 #   - Resume state stores /dev/disk/by-id paths so letter swaps cannot retarget disks.
 #   - Equal-size top disks refuse auto-select (require --target-disk / --work-disk).
 #   - VirtIO storage + network drivers are injected and registered boot-start (Cloud).
-#   - Cloud/KVM requires UEFI unless --bios is passed explicitly.
+#   - Cloud Legacy BIOS is fully supported via guaranteed GRUB ntldr path
+#     (GRUB on BOTH instance + Volume disks so firmware disk-0 order cannot brick boot).
+#   - UEFI remains preferred when available; --bios forces Legacy; --uefi forces UEFI.
 #   - Legacy BIOS uses GRUB i386-pc + ntldr /bootmgr (does not rely on NTFS VBR alone).
 #   - This version requires a dedicated workspace disk and does not support
 #     single-disk installs safely.
@@ -63,7 +65,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="3.5.2"
+SCRIPT_VERSION="3.6.0"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -933,14 +935,17 @@ detect_boot_mode() {
     elif [ -n "${FORCE_BIOS:-}" ]; then
         BOOT_MODE="bios"
         if is_virtual_machine; then
-            log_warn "Legacy BIOS forced on Cloud/KVM via --bios. UEFI is strongly recommended."
+            log_warn "Legacy BIOS forced on Cloud/KVM via --bios."
         fi
     elif is_virtual_machine; then
         if [ -d /sys/firmware/efi ]; then
             BOOT_MODE="uefi"
             log_detail "Cloud/KVM detected — using UEFI"
         else
-            die "Cloud/KVM detected but firmware is Legacy BIOS. Enable UEFI in the Hetzner Cloud Console, reboot to rescue, and re-run. To override knowingly, pass --bios."
+            # Guaranteed Legacy path (GRUB on instance + Volume). No --bios flag required.
+            BOOT_MODE="bios"
+            log_warn "Cloud/KVM Legacy BIOS detected — enabling guaranteed GRUB ntldr boot path."
+            log_warn "Tip: enable UEFI in Cloud Console when possible for the simplest boot chain."
         fi
     elif [ -d /sys/firmware/efi ]; then
         BOOT_MODE="uefi"
@@ -949,6 +954,34 @@ detect_boot_mode() {
     fi
     
     log_detail "Boot mode: ${BOOT_MODE^^}"
+}
+
+# Fail BEFORE wiping disks if Legacy BIOS cannot be made bootable.
+preflight_legacy_guaranteed() {
+    [ "${BOOT_MODE:-}" = "bios" ] || return 0
+
+    log_step "Legacy BIOS guaranteed-boot preflight..."
+
+    ensure_grub_pc || die "grub-install (grub-pc) is required for guaranteed Legacy BIOS boot and could not be installed."
+    log_detail "grub-install OK: $(command -v grub-install)"
+
+    if is_virtual_machine; then
+        ensure_hivexsh || die "hivexsh (libhivex-bin) is required on Cloud Legacy BIOS for VirtIO boot-start drivers."
+        log_detail "hivexsh OK: $(command -v hivexsh)"
+    fi
+
+    # Best-effort ms-sys (optional; not in Debian bookworm).
+    if ! command -v ms-sys &>/dev/null; then
+        apt_install_with_retries ms-sys >/dev/null 2>&1 || true
+        refresh_command_hash
+    fi
+    if command -v ms-sys &>/dev/null; then
+        log_detail "ms-sys OK (optional VBR helper)"
+    else
+        log_detail "ms-sys unavailable — OK, GRUB ntldr does not need it"
+    fi
+
+    log_info "Legacy BIOS preflight passed (GRUB ntldr path armed)."
 }
 
 preflight_health_check() {
@@ -2253,39 +2286,15 @@ ensure_grub_pc() {
     command -v grub-install &>/dev/null
 }
 
-# Install GRUB i386-pc that loads Windows bootmgr via ntldr.
-# Uses search --file /bootmgr so Cloud sda/sdb letter swaps cannot break hdN mapping.
-install_grub_bios_ntldr() {
-    local boot_mount="$1"
-    local grub_ok=0
-
-    ensure_grub_pc || {
-        log_warn "grub-install not available after apt"
-        return 1
-    }
-
-    mkdir -p "$boot_mount/grub"
-
-    # Core image must include ntfs + ntldr + search so MBR→bootmgr works without VBR code.
-    if grub-install \
-        --target=i386-pc \
-        --boot-directory="$boot_mount" \
-        --recheck \
-        --modules="part_msdos ntfs ntldr search_fs_file search_fs_uuid search_label biosdisk" \
-        "$TARGET_DISK" >/tmp/grub-install-bios.log 2>&1; then
-        grub_ok=1
-        log_detail "grub-install i386-pc succeeded on $TARGET_DISK"
-    else
-        log_warn "grub-install failed (see /tmp/grub-install-bios.log)"
-        return 1
-    fi
-
-    cat > "$boot_mount/grub/grub.cfg" <<'GRUBEOF'
-set timeout=1
+write_grub_ntldr_cfg() {
+    local grub_cfg="$1"
+    mkdir -p "$(dirname "$grub_cfg")"
+    cat > "$grub_cfg" <<'GRUBEOF'
+set timeout=0
 set default=0
 
-# Hardened Legacy BIOS → Windows bootmgr handoff.
-# search by file avoids wrong (hd0)/(hd1) when Cloud volumes reorder disks.
+# Guaranteed Legacy BIOS → Windows bootmgr.
+# search --file finds /bootmgr on ANY disk (fixes Cloud Volume = hd0 / sda).
 menuentry "Windows Server 2025" {
     insmod part_msdos
     insmod ntfs
@@ -2295,39 +2304,104 @@ menuentry "Windows Server 2025" {
     ntldr /bootmgr
 }
 GRUBEOF
+}
 
-    [ "$grub_ok" = "1" ] || return 1
-    [ -f "$boot_mount/grub/grub.cfg" ] || return 1
-    [ -d "$boot_mount/grub/i386-pc" ] || [ -f "$boot_mount/grub/i386-pc/core.img" ] || {
-        log_warn "GRUB i386-pc modules directory missing after install"
+# Install GRUB i386-pc + ntldr search on a specific disk.
+# boot_directory is where grub/ modules + grub.cfg live (must remain readable at boot
+# for non-embedded configs; for target we use the System Reserved partition).
+install_grub_bios_ntldr_on_disk() {
+    local disk="$1"
+    local boot_directory="$2"
+    local log_file="${3:-/tmp/grub-install-bios.log}"
+
+    ensure_grub_pc || return 1
+    mkdir -p "$boot_directory/grub"
+
+    if ! grub-install \
+        --target=i386-pc \
+        --boot-directory="$boot_directory" \
+        --recheck \
+        --force \
+        --modules="part_msdos ntfs ntldr search_fs_file search_fs_uuid search_label biosdisk" \
+        "$disk" >"$log_file" 2>&1; then
+        log_warn "grub-install failed on $disk (see $log_file)"
         return 1
-    }
+    fi
+
+    write_grub_ntldr_cfg "$boot_directory/grub/grub.cfg"
+    [ -f "$boot_directory/grub/grub.cfg" ] || return 1
+    [ -d "$boot_directory/grub/i386-pc" ] || [ -f "$boot_directory/grub/i386-pc/core.img" ] || return 1
+    log_detail "GRUB ntldr installed on $disk (boot-dir $boot_directory)"
     return 0
 }
 
-verify_bios_boot_chain() {
-    local boot_mount="$1"
-    local errors=0
+# Cloud Legacy often enumerates Volume as sda (BIOS hd0) while Windows is on sdb.
+# Installing the same search-/bootmgr GRUB on the work disk guarantees firmware
+# disk-0 still reaches Windows.
+install_grub_bios_on_work_disk() {
+    [ "${BOOT_MODE:-}" = "bios" ] || return 0
+    [ -n "${WORK_DISK:-}" ] && [ -b "$WORK_DISK" ] || return 0
 
-    [ -f "$boot_mount/bootmgr" ] || { log_error "Missing $boot_mount/bootmgr"; errors=$((errors + 1)); }
-    [ -f "$boot_mount/Boot/BCD" ] || [ -f "$boot_mount/boot/BCD" ] || {
-        # BCD is written in write_boot_bcd() after this function; allow missing here.
-        true
-    }
+    log_step "Installing GRUB redirect on work disk ($WORK_DISK) for BIOS disk-0 safety..."
 
-    # Partition 1 must be active (bootable) for many BIOSes / ms-sys paths.
-    if command -v parted &>/dev/null; then
-        if ! parted -s "$TARGET_DISK" print 2>/dev/null | awk '/^ 1 / && /boot/ {found=1} END {exit !found}'; then
-            log_warn "Partition 1 not marked boot; re-applying boot flag"
-            parted -s "$TARGET_DISK" set 1 boot on 2>/dev/null || true
-        fi
+    local work_part
+    work_part="${WORK_PART:-$(partition_path "$WORK_DISK" 1)}"
+    mkdir -p "$MOUNT_WORK"
+    if ! mountpoint -q "$MOUNT_WORK" 2>/dev/null; then
+        mount "$work_part" "$MOUNT_WORK" 2>/dev/null || {
+            log_warn "Could not mount work disk to install GRUB redirect"
+            return 1
+        }
     fi
 
-    [ "$errors" -eq 0 ]
+    local grub_dir="$MOUNT_WORK/.bios-grub"
+    if install_grub_bios_ntldr_on_disk "$WORK_DISK" "$grub_dir" /tmp/grub-install-work.log; then
+        log_info "Work-disk GRUB redirect OK — firmware can boot Volume or instance disk."
+        return 0
+    fi
+
+    if is_virtual_machine; then
+        die "Failed to install GRUB redirect on work disk $WORK_DISK (required on Cloud Legacy when Volume may be BIOS disk 0). See /tmp/grub-install-work.log"
+    fi
+    log_warn "Work-disk GRUB redirect failed (non-fatal on bare-metal)"
+    return 1
+}
+
+verify_legacy_boot_ready() {
+    [ "${BOOT_MODE:-}" = "bios" ] || return 0
+
+    log_step "Verifying Legacy BIOS boot chain..."
+    local boot_mount="/mnt/bootpart"
+    mkdir -p "$boot_mount"
+    if ! mountpoint -q "$boot_mount" 2>/dev/null; then
+        mount "$BOOT_PART" "$boot_mount" || die "Cannot mount boot partition for final verify"
+    fi
+
+    local errors=0
+    [ -f "$boot_mount/bootmgr" ] || { log_error "Missing bootmgr on System Reserved"; errors=$((errors + 1)); }
+    [ -f "$boot_mount/Boot/BCD" ] || { log_error "Missing Boot\\BCD on System Reserved"; errors=$((errors + 1)); }
+    [ -f "$boot_mount/grub/grub.cfg" ] || { log_error "Missing grub.cfg on System Reserved"; errors=$((errors + 1)); }
+
+    # MBR magic 0x55AA on target
+    local mbr_sig
+    mbr_sig=$(od -An -tx1 -N2 -j510 "$TARGET_DISK" 2>/dev/null | tr -d ' \n')
+    if [ "$mbr_sig" != "55aa" ]; then
+        log_error "Target disk MBR signature invalid (got '$mbr_sig', want 55aa)"
+        errors=$((errors + 1))
+    else
+        log_detail "Target MBR signature OK (55aa)"
+    fi
+
+    umount "$boot_mount" 2>/dev/null || true
+
+    [ "$errors" -eq 0 ] || die "Legacy BIOS boot verification failed ($errors error(s)). Not rebooting into a broken chain."
+    log_info "Legacy BIOS boot chain verified (bootmgr + BCD + GRUB)."
 }
 
 setup_bios_boot() {
-    log_detail "Configuring hardened Legacy BIOS boot (GRUB ntldr + ms-sys)..."
+    log_detail "Configuring guaranteed Legacy BIOS boot (GRUB ntldr on instance disk)..."
+
+    ensure_grub_pc || die "grub-install required for Legacy BIOS but is not available."
 
     # Re-assert active/boot flag before staging files
     parted -s "$TARGET_DISK" set 1 boot on 2>/dev/null || true
@@ -2361,7 +2435,6 @@ setup_bios_boot() {
     # Also keep a copy on the Windows volume (bcdboot / recovery expect it)
     cp "$boot_mount/bootmgr" "$MOUNT_TARGET/bootmgr" 2>/dev/null || true
     mkdir -p "$MOUNT_TARGET/Boot"
-    # Stage non-BCD PCAT files on Windows volume too (repair / bcdboot helpers)
     if [ -d "$MOUNT_TARGET/Windows/Boot/PCAT" ]; then
         find "$MOUNT_TARGET/Windows/Boot/PCAT" -maxdepth 1 -type f \
             ! -iname 'BCD' ! -iname 'BCD.*' \
@@ -2371,58 +2444,28 @@ setup_bios_boot() {
     mkdir -p "$boot_mount/Boot/Fonts"
     cp "$MOUNT_TARGET/Windows/Boot/Fonts/"* "$boot_mount/Boot/Fonts/" 2>/dev/null || true
 
-    # Critical BIOS files
     if [ ! -f "$boot_mount/bootmgr" ]; then
         umount "$boot_mount" 2>/dev/null || true
         die "BIOS boot files incomplete after copy (bootmgr missing)"
     fi
 
-    # 1) NTFS VBR boot code (helps native Windows MBR path / chainloader +1)
-    local vbr_ok=0 mbr_ok=0 grub_ok=0
+    # Optional NTFS VBR (helps chainloader +1); GRUB ntldr does not depend on it.
     if command -v ms-sys &>/dev/null; then
-        if ms-sys -n "$BOOT_PART" 2>/dev/null; then
-            vbr_ok=1
-            log_detail "Wrote NTFS VBR boot code to $BOOT_PART"
-        else
-            log_warn "ms-sys VBR write failed (GRUB ntldr path does not need VBR)"
-        fi
-        # Windows MBR as secondary; GRUB will overwrite MBR next (intentional).
-        if ms-sys -7 "$TARGET_DISK" 2>/dev/null; then
-            mbr_ok=1
-            log_detail "Wrote Windows MBR to $TARGET_DISK (may be replaced by GRUB)"
-        fi
-    else
-        log_warn "ms-sys not installed; skipping native Windows MBR/VBR"
+        ms-sys -n "$BOOT_PART" 2>/dev/null && log_detail "Wrote NTFS VBR boot code to $BOOT_PART" || true
     fi
 
-    # 2) Primary path: GRUB → ntldr /bootmgr (reliable on Cloud Legacy BIOS)
-    if install_grub_bios_ntldr "$boot_mount"; then
-        grub_ok=1
-        log_info "GRUB Legacy BIOS bootloader installed (ntldr → /bootmgr)"
-    else
-        log_warn "GRUB ntldr install failed — falling back to native Windows MBR/VBR only"
-        # Restore Windows MBR if GRUB failed after overwriting attempt
-        if command -v ms-sys &>/dev/null; then
-            ms-sys -7 "$TARGET_DISK" 2>/dev/null && mbr_ok=1 || true
-        fi
+    # Required: GRUB → search /bootmgr → ntldr (instance / Windows disk)
+    if ! install_grub_bios_ntldr_on_disk "$TARGET_DISK" "$boot_mount" /tmp/grub-install-bios.log; then
+        umount "$boot_mount" 2>/dev/null || true
+        die "GRUB ntldr install failed on $TARGET_DISK — Legacy BIOS cannot be guaranteed. See /tmp/grub-install-bios.log"
     fi
 
-    verify_bios_boot_chain "$boot_mount" || true
+    parted -s "$TARGET_DISK" set 1 boot on 2>/dev/null || true
 
     umount "$boot_mount"
     rmdir "$boot_mount" 2>/dev/null || true
 
-    # Must have GRUB ntldr OR complete native MBR+VBR — otherwise first boot is a brick.
-    if [ "$grub_ok" = "1" ]; then
-        log_info "Legacy BIOS boot configured (primary: GRUB ntldr)."
-        return 0
-    fi
-    if [ "$mbr_ok" = "1" ] && [ "$vbr_ok" = "1" ]; then
-        log_warn "Legacy BIOS boot configured (fallback: ms-sys MBR+VBR only)."
-        return 0
-    fi
-
-    die "Legacy BIOS boot chain incomplete (grub=$grub_ok mbr=$mbr_ok vbr=$vbr_ok). Re-run with UEFI enabled, or fix grub-pc/ms-sys packages and retry with --force."
+    log_info "Legacy BIOS boot configured on $TARGET_DISK (GRUB ntldr → /bootmgr)."
 }
 
 write_boot_bcd() {
@@ -2707,7 +2750,7 @@ parse_args() {
                 echo "  --skip-confirm      Skip all confirmation prompts (default if stdin is not a TTY)"
                 echo "  --confirm           Require typing 'yes' before wiping disks"
                 echo "  --uefi              Force UEFI boot mode"
-                echo "  --bios              Force Legacy BIOS (required override on Cloud without UEFI)"
+                echo "  --bios              Force Legacy BIOS (auto on Cloud when firmware is Legacy)"
                 echo "  --single-disk       Not supported safely in this version"
                 echo "  --interactive, -i   Launch interactive wizard"
                 echo "  --dry-run           Validate detection and configuration only"
@@ -2786,6 +2829,7 @@ main() {
     detect_boot_mode
     generate_password
     preflight_health_check
+    preflight_legacy_guaranteed
     evaluate_resume_options
     set_stage "detection"
     
@@ -2830,6 +2874,8 @@ main() {
     progress_step 9 "Boot setup"
     setup_bootloader
     write_boot_bcd
+    install_grub_bios_on_work_disk
+    verify_legacy_boot_ready
     set_stage "boot_setup"
     
     progress_step 10 "Finalize"
