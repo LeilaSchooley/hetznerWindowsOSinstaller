@@ -157,11 +157,13 @@ load_state() {
     log_info "Found previous state ($STATE_FILE): STAGE=${STAGE:-unknown}"
 }
 
-log_info()    { echo -e "${GREEN}[INFO]${NC} $*"; }
-log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
-log_error()   { echo -e "${RED}[ERROR]${NC} $*"; }
-log_step()    { echo -e "${CYAN}[STEP]${NC} $*"; }
-log_detail()  { echo -e "${BLUE}  →${NC} $*"; }
+# Logs go to stderr so command substitutions like image_index=$(select_...)
+# only capture the intended return value on stdout (not log arrows).
+log_info()    { echo -e "${GREEN}[INFO]${NC} $*" >&2; }
+log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+log_step()    { echo -e "${CYAN}[STEP]${NC} $*" >&2; }
+log_detail()  { echo -e "${BLUE}  →${NC} $*" >&2; }
 
 TOTAL_STEPS=10
 
@@ -174,7 +176,7 @@ progress_step() {
 
     bar=$(printf '%*s' "$filled" '' | tr ' ' '#')
     printf "\n${CYAN}[PROGRESS]${NC} Step %s/%s (%s%%) %-20s [%s%-*s]\n" \
-        "$step" "$TOTAL_STEPS" "$percent" "$label" "$bar" "$((20 - filled))" ""
+        "$step" "$TOTAL_STEPS" "$percent" "$label" "$bar" "$((20 - filled))" "" >&2
 }
 
 prefix_to_netmask() {
@@ -1211,6 +1213,9 @@ extract_windows() {
     # Typical Server 2025 EVAL order: 1=Standard Core, 2=Standard Desktop, 3=DC Core, 4=DC Desktop.
     local image_index
     image_index=$(select_windows_image_index "$wim_file")
+    # Keep only a bare index (defense in depth if a log line ever leaks to stdout).
+    image_index=$(printf '%s\n' "$image_index" | grep -E '^[0-9]+$' | tail -n1)
+    [[ "$image_index" =~ ^[0-9]+$ ]] || die "Could not resolve a Windows image index from $(basename "$wim_file")"
     
     wimlib-imagex info "$wim_file" "$image_index" >/dev/null 2>&1 || die "Selected Windows image index $image_index is not available"
     
