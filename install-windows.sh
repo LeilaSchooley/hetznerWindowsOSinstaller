@@ -63,7 +63,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="3.5.1"
+SCRIPT_VERSION="3.5.2"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -606,19 +606,57 @@ ensure_wimlib() {
     return 1
 }
 
+# Install each package individually so one missing name (e.g. ms-sys) cannot
+# abort the entire recommended set.
+apt_install_each() {
+    local pkg
+    local failed=0
+    for pkg in "$@"; do
+        if dpkg -s "$pkg" >/dev/null 2>&1; then
+            continue
+        fi
+        if ! apt_install_with_retries "$pkg"; then
+            log_warn "Optional/recommended package unavailable: $pkg"
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+ensure_hivexsh() {
+    refresh_command_hash
+    if command -v hivexsh &>/dev/null; then
+        return 0
+    fi
+    log_detail "Installing libhivex-bin (needed for VirtIO SYSTEM hive registration)..."
+    apt_update_with_retries || true
+    apt_install_with_retries libhivex-bin || true
+    refresh_command_hash
+    if command -v hivexsh &>/dev/null; then
+        return 0
+    fi
+    # Last resort: package may be named differently on some mirrors
+    apt_install_with_retries libhivex0 libhivex-bin || true
+    refresh_command_hash
+    command -v hivexsh &>/dev/null
+}
+
 check_dependencies() {
     log_step "Checking dependencies..."
     refresh_command_hash
 
     local deps=(wget parted mkfs.ntfs wimlib-imagex lsblk mkfs.fat awk cut ip python3 blkid numfmt)
-    local always_pkgs=(
+    # Core set — must exist on Debian bookworm rescue. Do NOT include ms-sys
+    # (not in bookworm); it is attempted separately as optional.
+    local core_pkgs=(
         wget parted ntfs-3g wimtools dosfstools gdisk
         grub-pc grub-pc-bin grub2-common grub-efi-amd64-bin
-        efibootmgr libhivex-bin ms-sys
+        efibootmgr libhivex-bin
         util-linux iproute2 python3 ca-certificates
     )
+    local optional_pkgs=(ms-sys)
     local missing=()
-    local dep pkgs pkg
+    local dep pkgs
 
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" &>/dev/null; then
@@ -626,35 +664,60 @@ check_dependencies() {
         fi
     done
 
-    if [ ${#missing[@]} -eq 0 ]; then
-        log_info "All dependencies already present."
-        return 0
+    if [ ${#missing[@]} -gt 0 ]; then
+        log_info "Missing tools: ${missing[*]}"
+    else
+        log_info "Core tools present — ensuring boot/VirtIO helper packages..."
     fi
-
-    log_info "Missing tools: ${missing[*]}"
-    log_info "Installing packages via apt (output logged, failures are not hidden)..."
 
     if ! apt_update_with_retries; then
         log_warn "apt-get update failed; will still attempt package install and offline fallbacks"
     fi
 
-    # Install the full recommended set first (covers optional boot helpers too).
-    if ! apt_install_with_retries "${always_pkgs[@]}"; then
-        log_warn "Bulk apt install reported errors; retrying per missing tool..."
-        for dep in "${missing[@]}"; do
+    # Install one-by-one so a single unavailable package cannot block hivex/grub.
+    apt_install_each "${core_pkgs[@]}" || true
+
+    # Retry explicitly for any still-missing required tools.
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
             pkgs=$(tool_to_packages "$dep")
             if [ -n "$pkgs" ]; then
                 # shellcheck disable=SC2086
                 apt_install_with_retries $pkgs || log_warn "Could not apt-install packages for '$dep': $pkgs"
             fi
-        done
-    fi
+        fi
+    done
+
+    # Optional BIOS helper (not in Debian bookworm — ignore failure; GRUB ntldr covers BIOS).
+    apt_install_each "${optional_pkgs[@]}" || true
 
     refresh_command_hash
 
     # Critical fallback for wimlib (often missing on slim rescue images).
     if ! command -v wimlib-imagex &>/dev/null; then
         ensure_wimlib || die "Required tool 'wimlib-imagex' not found after apt, Debian .deb, and source-build fallbacks. Check $LOG_FILE and network/apt mirrors."
+    fi
+
+    # Cloud VirtIO hive edits need hivexsh — fail early if missing.
+    if ! ensure_hivexsh; then
+        if is_virtual_machine; then
+            die "hivexsh (libhivex-bin) is required on Cloud/KVM for VirtIO boot-start registration but could not be installed."
+        fi
+        log_warn "hivexsh unavailable — VirtIO SYSTEM hive registration will be skipped on bare-metal"
+    else
+        log_detail "hivexsh: $(command -v hivexsh)"
+    fi
+
+    if command -v grub-install &>/dev/null; then
+        log_detail "grub-install: $(command -v grub-install)"
+    else
+        log_warn "grub-install missing — Legacy BIOS path will be weaker (install grub-pc)"
+    fi
+
+    if command -v ms-sys &>/dev/null; then
+        log_detail "ms-sys: $(command -v ms-sys)"
+    else
+        log_detail "ms-sys not available (OK — GRUB ntldr is the primary BIOS path)"
     fi
 
     local still_missing=()
@@ -1630,9 +1693,9 @@ register_virtio_boot_services() {
         return
     fi
 
-    if ! command -v hivexsh &>/dev/null; then
+    if ! ensure_hivexsh; then
         if is_virtual_machine; then
-            die "hivexsh not available; cannot register VirtIO boot drivers on Cloud."
+            die "hivexsh not available; cannot register VirtIO boot drivers on Cloud. Install libhivex-bin and re-run with --force."
         fi
         log_warn "hivexsh not available; skipped VirtIO service registration."
         return
