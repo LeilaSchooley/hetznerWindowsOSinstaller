@@ -82,6 +82,7 @@ No files to download to your PC. No SCP. No uploads. Just one SSH command.
 - **Equal-size guard** — Refuses ambiguous auto-select when top disks are the same size
 - **VirtIO boot-start** — Registers `viostor`/`vioscsi` in the offline SYSTEM hive (Cloud-safe)
 - **UEFI on Cloud** — Requires UEFI for KVM unless `--bios` is passed explicitly
+- **Hardened Legacy BIOS** — GRUB `ntldr /bootmgr` primary path + ms-sys VBR; refuses incomplete boot chains
 - **RDP Pre-configured** — Remote Desktop enabled and firewall rules applied on first boot
 - **Built-in Network Repair** — `C:\fix-network.cmd` auto-placed on Windows drive for KVM use
 - **Unattended Install** — Full OOBE bypass, auto-login for setup, and post-install hardening
@@ -165,7 +166,7 @@ bash install-windows.sh --dry-run
 
 - Attach a **Volume** as workspace (ISO download). The installer picks the **largest** disk for Windows and the **second-largest** for work — never by `sda`/`sdb` letter order.
 - VirtIO storage + network drivers are injected and registered boot-start on KVM/Cloud (`viostor` + `NetKVM` required).
-- **UEFI is required** on Cloud/KVM (enable in Cloud Console). Pass `--bios` only if you knowingly need Legacy BIOS.
+- **UEFI is required** on Cloud/KVM (enable in Cloud Console). Pass `--bios` only if you knowingly need Legacy BIOS — BIOS installs use a hardened GRUB→`bootmgr` path, but UEFI is still preferred.
 - If the two largest disks are the same size, pass `--target-disk` / `--work-disk` (prefer `/dev/disk/by-id/...`).
 
 ### Command-Line Options

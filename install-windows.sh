@@ -52,6 +52,7 @@
 #   - Equal-size top disks refuse auto-select (require --target-disk / --work-disk).
 #   - VirtIO storage + network drivers are injected and registered boot-start (Cloud).
 #   - Cloud/KVM requires UEFI unless --bios is passed explicitly.
+#   - Legacy BIOS uses GRUB i386-pc + ntldr /bootmgr (does not rely on NTFS VBR alone).
 #   - This version requires a dedicated workspace disk and does not support
 #     single-disk installs safely.
 #   - Progress is saved to /root/.hetzner-win-install-state for resume.
@@ -62,7 +63,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="3.5.0"
+SCRIPT_VERSION="3.5.1"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -285,6 +286,15 @@ resolve_disk_device() {
 
 disk_size_bytes() {
     lsblk -dbno SIZE "$1" 2>/dev/null || echo 0
+}
+
+# True for Hetzner Cloud attached Volumes (must not be the Windows/boot disk).
+is_hetzner_cloud_volume() {
+    local disk="$1"
+    local model id
+    model=$(lsblk -dpno MODEL "$disk" 2>/dev/null || true)
+    id=$(disk_stable_id "$disk")
+    [[ "$model" == *[Vv]olume* ]] || [[ "$id" == *HC_Volume* ]] || [[ "$id" == *scsi-0HC_Volume* ]]
 }
 
 # True when running under KVM/QEMU (Hetzner Cloud / most CX/CPX/CAX plans).
@@ -603,7 +613,8 @@ check_dependencies() {
     local deps=(wget parted mkfs.ntfs wimlib-imagex lsblk mkfs.fat awk cut ip python3 blkid numfmt)
     local always_pkgs=(
         wget parted ntfs-3g wimtools dosfstools gdisk
-        grub-pc-bin grub-efi-amd64-bin efibootmgr libhivex-bin ms-sys
+        grub-pc grub-pc-bin grub2-common grub-efi-amd64-bin
+        efibootmgr libhivex-bin ms-sys
         util-linux iproute2 python3 ca-certificates
     )
     local missing=()
@@ -838,6 +849,14 @@ detect_disks() {
         die "Target disk is too small for Windows Server: $TARGET_DISK ($(numfmt --to=iec "$target_size" 2>/dev/null || echo "$target_size"))"
     [ "$work_size" -ge "$MIN_WORK_DISK_BYTES" ] || \
         die "Work disk is too small for ISO workspace: $WORK_DISK ($(numfmt --to=iec "$work_size" 2>/dev/null || echo "$work_size"))"
+
+    # Cloud Volumes are not firmware-bootable — Windows must sit on the instance disk.
+    if is_hetzner_cloud_volume "$TARGET_DISK"; then
+        die "Target disk $TARGET_DISK looks like a Hetzner Cloud Volume (not firmware-bootable). Put Windows on the instance disk (QEMU HARDDISK) and use the Volume as --work-disk."
+    fi
+    if is_virtual_machine && is_hetzner_cloud_volume "$WORK_DISK"; then
+        log_detail "Work disk is a Cloud Volume (expected for ISO workspace)"
+    fi
 
     log_detail "Target disk (Windows): $TARGET_DISK ($TARGET_DISK_ID)"
     log_detail "Work disk (temp):      $WORK_DISK ($WORK_DISK_ID)"
@@ -2160,16 +2179,103 @@ setup_uefi_boot() {
     log_info "UEFI boot configured."
 }
 
+# Ensure grub-install is available (full grub-pc, not only -bin).
+ensure_grub_pc() {
+    if command -v grub-install &>/dev/null; then
+        return 0
+    fi
+    log_detail "Installing grub-pc for Legacy BIOS bootloader..."
+    apt_install_with_retries grub-pc grub-pc-bin grub2-common || return 1
+    refresh_command_hash
+    command -v grub-install &>/dev/null
+}
+
+# Install GRUB i386-pc that loads Windows bootmgr via ntldr.
+# Uses search --file /bootmgr so Cloud sda/sdb letter swaps cannot break hdN mapping.
+install_grub_bios_ntldr() {
+    local boot_mount="$1"
+    local grub_ok=0
+
+    ensure_grub_pc || {
+        log_warn "grub-install not available after apt"
+        return 1
+    }
+
+    mkdir -p "$boot_mount/grub"
+
+    # Core image must include ntfs + ntldr + search so MBR→bootmgr works without VBR code.
+    if grub-install \
+        --target=i386-pc \
+        --boot-directory="$boot_mount" \
+        --recheck \
+        --modules="part_msdos ntfs ntldr search_fs_file search_fs_uuid search_label biosdisk" \
+        "$TARGET_DISK" >/tmp/grub-install-bios.log 2>&1; then
+        grub_ok=1
+        log_detail "grub-install i386-pc succeeded on $TARGET_DISK"
+    else
+        log_warn "grub-install failed (see /tmp/grub-install-bios.log)"
+        return 1
+    fi
+
+    cat > "$boot_mount/grub/grub.cfg" <<'GRUBEOF'
+set timeout=1
+set default=0
+
+# Hardened Legacy BIOS → Windows bootmgr handoff.
+# search by file avoids wrong (hd0)/(hd1) when Cloud volumes reorder disks.
+menuentry "Windows Server 2025" {
+    insmod part_msdos
+    insmod ntfs
+    insmod ntldr
+    insmod search_fs_file
+    search --file --no-floppy --set=root /bootmgr
+    ntldr /bootmgr
+}
+GRUBEOF
+
+    [ "$grub_ok" = "1" ] || return 1
+    [ -f "$boot_mount/grub/grub.cfg" ] || return 1
+    [ -d "$boot_mount/grub/i386-pc" ] || [ -f "$boot_mount/grub/i386-pc/core.img" ] || {
+        log_warn "GRUB i386-pc modules directory missing after install"
+        return 1
+    }
+    return 0
+}
+
+verify_bios_boot_chain() {
+    local boot_mount="$1"
+    local errors=0
+
+    [ -f "$boot_mount/bootmgr" ] || { log_error "Missing $boot_mount/bootmgr"; errors=$((errors + 1)); }
+    [ -f "$boot_mount/Boot/BCD" ] || [ -f "$boot_mount/boot/BCD" ] || {
+        # BCD is written in write_boot_bcd() after this function; allow missing here.
+        true
+    }
+
+    # Partition 1 must be active (bootable) for many BIOSes / ms-sys paths.
+    if command -v parted &>/dev/null; then
+        if ! parted -s "$TARGET_DISK" print 2>/dev/null | awk '/^ 1 / && /boot/ {found=1} END {exit !found}'; then
+            log_warn "Partition 1 not marked boot; re-applying boot flag"
+            parted -s "$TARGET_DISK" set 1 boot on 2>/dev/null || true
+        fi
+    fi
+
+    [ "$errors" -eq 0 ]
+}
+
 setup_bios_boot() {
-    log_detail "Configuring Legacy BIOS boot..."
-    
+    log_detail "Configuring hardened Legacy BIOS boot (GRUB ntldr + ms-sys)..."
+
+    # Re-assert active/boot flag before staging files
+    parted -s "$TARGET_DISK" set 1 boot on 2>/dev/null || true
+
     # Mount boot partition (System Reserved)
     local boot_mount="/mnt/bootpart"
     mkdir -p "$boot_mount"
     mount "$BOOT_PART" "$boot_mount" || die "Failed to mount boot partition"
-    
+
     mkdir -p "$boot_mount/Boot"
-    
+
     if [ -d "$MOUNT_TARGET/Windows/Boot/PCAT" ]; then
         # Copy everything except BCD and BCD.LOG (stale device refs → 0xc000000f)
         find "$MOUNT_TARGET/Windows/Boot/PCAT" -maxdepth 1 -type f \
@@ -2178,52 +2284,82 @@ setup_bios_boot() {
         find "$MOUNT_TARGET/Windows/Boot/PCAT" -mindepth 1 -maxdepth 1 -type d \
             -exec cp -r {} "$boot_mount/Boot/" \; 2>/dev/null || true
     fi
-    
+
     # bootmgr must live on the active/boot partition root
     if [ -f "$MOUNT_TARGET/bootmgr" ]; then
         cp "$MOUNT_TARGET/bootmgr" "$boot_mount/" || die "Failed to copy bootmgr to boot partition"
     elif [ -f "$MOUNT_TARGET/Windows/Boot/PCAT/bootmgr" ]; then
         cp "$MOUNT_TARGET/Windows/Boot/PCAT/bootmgr" "$boot_mount/" || die "Failed to copy bootmgr to boot partition"
     else
+        umount "$boot_mount" 2>/dev/null || true
         die "bootmgr not found in applied Windows image — BIOS boot cannot be configured"
     fi
 
     # Also keep a copy on the Windows volume (bcdboot / recovery expect it)
     cp "$boot_mount/bootmgr" "$MOUNT_TARGET/bootmgr" 2>/dev/null || true
-    
+    mkdir -p "$MOUNT_TARGET/Boot"
+    # Stage non-BCD PCAT files on Windows volume too (repair / bcdboot helpers)
+    if [ -d "$MOUNT_TARGET/Windows/Boot/PCAT" ]; then
+        find "$MOUNT_TARGET/Windows/Boot/PCAT" -maxdepth 1 -type f \
+            ! -iname 'BCD' ! -iname 'BCD.*' \
+            -exec cp -n {} "$MOUNT_TARGET/Boot/" \; 2>/dev/null || true
+    fi
+
     mkdir -p "$boot_mount/Boot/Fonts"
     cp "$MOUNT_TARGET/Windows/Boot/Fonts/"* "$boot_mount/Boot/Fonts/" 2>/dev/null || true
 
     # Critical BIOS files
-    [ -f "$boot_mount/Boot/bootmgr.exe" ] || [ -f "$boot_mount/bootmgr" ] || \
-        die "BIOS boot files incomplete after copy"
+    if [ ! -f "$boot_mount/bootmgr" ]; then
+        umount "$boot_mount" 2>/dev/null || true
+        die "BIOS boot files incomplete after copy (bootmgr missing)"
+    fi
 
-    umount "$boot_mount"
-    rmdir "$boot_mount"
-    
-    # Write Windows 7+ MBR and NTFS VBR boot code (ms-sys).
-    # Note: bootmgr is a PE executable, NOT MBR boot sector data — never dd it to MBR.
-    local mbr_ok=0 vbr_ok=0
+    # 1) NTFS VBR boot code (helps native Windows MBR path / chainloader +1)
+    local vbr_ok=0 mbr_ok=0 grub_ok=0
     if command -v ms-sys &>/dev/null; then
-        if ms-sys -7 "$TARGET_DISK" 2>/dev/null; then
-            mbr_ok=1
-            log_detail "Wrote Windows MBR to $TARGET_DISK"
-        fi
         if ms-sys -n "$BOOT_PART" 2>/dev/null; then
             vbr_ok=1
             log_detail "Wrote NTFS VBR boot code to $BOOT_PART"
+        else
+            log_warn "ms-sys VBR write failed (GRUB ntldr path does not need VBR)"
+        fi
+        # Windows MBR as secondary; GRUB will overwrite MBR next (intentional).
+        if ms-sys -7 "$TARGET_DISK" 2>/dev/null; then
+            mbr_ok=1
+            log_detail "Wrote Windows MBR to $TARGET_DISK (may be replaced by GRUB)"
+        fi
+    else
+        log_warn "ms-sys not installed; skipping native Windows MBR/VBR"
+    fi
+
+    # 2) Primary path: GRUB → ntldr /bootmgr (reliable on Cloud Legacy BIOS)
+    if install_grub_bios_ntldr "$boot_mount"; then
+        grub_ok=1
+        log_info "GRUB Legacy BIOS bootloader installed (ntldr → /bootmgr)"
+    else
+        log_warn "GRUB ntldr install failed — falling back to native Windows MBR/VBR only"
+        # Restore Windows MBR if GRUB failed after overwriting attempt
+        if command -v ms-sys &>/dev/null; then
+            ms-sys -7 "$TARGET_DISK" 2>/dev/null && mbr_ok=1 || true
         fi
     fi
 
-    if [ "$mbr_ok" != "1" ] || [ "$vbr_ok" != "1" ]; then
-        log_warn "ms-sys MBR/VBR write incomplete (mbr=$mbr_ok vbr=$vbr_ok)."
-        log_warn "BCD template + first-boot bcdboot should still repair boot on many systems."
-        if is_virtual_machine; then
-            log_warn "On Hetzner Cloud, prefer UEFI (enable in Cloud Console) and re-run with --uefi."
-        fi
+    verify_bios_boot_chain "$boot_mount" || true
+
+    umount "$boot_mount"
+    rmdir "$boot_mount" 2>/dev/null || true
+
+    # Must have GRUB ntldr OR complete native MBR+VBR — otherwise first boot is a brick.
+    if [ "$grub_ok" = "1" ]; then
+        log_info "Legacy BIOS boot configured (primary: GRUB ntldr)."
+        return 0
     fi
-    
-    log_info "Legacy BIOS boot configured."
+    if [ "$mbr_ok" = "1" ] && [ "$vbr_ok" = "1" ]; then
+        log_warn "Legacy BIOS boot configured (fallback: ms-sys MBR+VBR only)."
+        return 0
+    fi
+
+    die "Legacy BIOS boot chain incomplete (grub=$grub_ok mbr=$mbr_ok vbr=$vbr_ok). Re-run with UEFI enabled, or fix grub-pc/ms-sys packages and retry with --force."
 }
 
 write_boot_bcd() {
@@ -2256,8 +2392,11 @@ write_boot_bcd() {
     fi
     
     if [ -z "$src_bcd" ]; then
-        log_warn "No BCD template found. Adding bcdboot recovery to first-boot commands."
         umount "$mount_point" 2>/dev/null || true
+        if [ "$BOOT_MODE" = "bios" ]; then
+            die "No BCD-Template in Windows image — Legacy BIOS cannot build Boot\\BCD. Re-apply image or use UEFI."
+        fi
+        log_warn "No BCD template found. Adding bcdboot recovery to first-boot commands."
         return
     fi
     
@@ -2265,15 +2404,19 @@ write_boot_bcd() {
     udevadm settle --timeout=5 2>/dev/null || true
 
     mkdir -p "$(dirname "$bcd_path")"
-    cp "$src_bcd" "$bcd_path"
+    cp "$src_bcd" "$bcd_path" || {
+        umount "$mount_point" 2>/dev/null || true
+        die "Failed to write BCD to $bcd_path"
+    }
+    [ -f "$bcd_path" ] || {
+        umount "$mount_point" 2>/dev/null || true
+        die "BCD missing after write: $bcd_path"
+    }
     log_detail "BCD initialized from $src_bcd"
-    
+
     # The BCD-Template shipped with Windows uses "locate" device entries
-    # that search all partitions for \Windows\system32\winload.efi at boot.
-    # This allows the first boot to succeed without patching exact partition
-    # GUIDs into the binary BCD hive.  The first-boot bcdboot command
-    # (in SetupComplete.cmd and FirstLogonCommands) will then create a
-    # permanent BCD with the correct partition references.
+    # that search all partitions for winload at boot. First-boot bcdboot
+    # then creates a permanent BCD with correct partition references.
     
     umount "$mount_point" 2>/dev/null || true
     log_info "BCD setup completed."
@@ -2302,6 +2445,11 @@ echo Running Hetzner first-boot setup... >> C:\hetzner-setup.log
 REM Rebuild BCD with correct partition references (critical for first boot)
 echo Rebuilding BCD boot configuration... >> C:\hetzner-setup.log
 bcdboot C:\Windows /f ALL >> C:\hetzner-setup.log 2>&1
+REM BIOS hardening: also rewrite NT60 boot code on system/boot volumes when available
+if exist "%SystemRoot%\System32\bootsect.exe" (
+    bootsect /nt60 SYS /mbr >> C:\hetzner-setup.log 2>&1
+    bootsect /nt60 ALL /force >> C:\hetzner-setup.log 2>&1
+)
 echo BCD rebuild complete. >> C:\hetzner-setup.log
 
 REM Clean up this script
