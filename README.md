@@ -9,7 +9,7 @@ Fully automated Windows Server 2025 deployment for Hetzner dedicated servers. **
 SSH into your Hetzner rescue system and run **one command**:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install.sh | bash
+wget -qO- https://raw.githubusercontent.com/LeilaSchooley/hetznerWindowsOSinstaller/main/install.sh | bash
 ```
 
 That's it. Everything is downloaded and executed automatically.
@@ -17,13 +17,13 @@ That's it. Everything is downloaded and executed automatically.
 ### With Custom Password
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install.sh | bash -s -- --password "YourPass123!"
+wget -qO- https://raw.githubusercontent.com/LeilaSchooley/hetznerWindowsOSinstaller/main/install.sh | bash -s -- --password "YourPass123!"
 ```
 
 ### Interactive Wizard (Recommended for First-Time Users)
 
 ```bash
-wget -O /root/install.sh https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install.sh
+wget -O /root/install.sh https://raw.githubusercontent.com/LeilaSchooley/hetznerWindowsOSinstaller/main/install.sh
 bash /root/install.sh --interactive
 ```
 
@@ -92,7 +92,7 @@ No files to download to your PC. No SCP. No uploads. Just one SSH command.
    https://api.github.com/repos/<owner>/<repo>/contents/install-windows.sh?ref=main
    https://raw.githubusercontent.com/<owner>/<repo>/main/install-windows.sh
    ```
-4. Users run: `wget -qO- https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install.sh | bash`
+4. Users run: `wget -qO- https://raw.githubusercontent.com/LeilaSchooley/hetznerWindowsOSinstaller/main/install.sh | bash`
 
 ### Option 2: Any Web Server
 
@@ -108,18 +108,14 @@ Great for fast global delivery. Upload files and use the worker URL.
 
 ```bash
 # Download and run directly (no bootstrap)
-wget -O /root/install-windows.sh https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install-windows.sh
+wget -O /root/install-windows.sh https://raw.githubusercontent.com/LeilaSchooley/hetznerWindowsOSinstaller/main/install-windows.sh
 bash /root/install-windows.sh
 
-# Full manual control
+# Full manual control (disks auto-picked by size if omitted)
 bash install-windows.sh \
-  --ip 37.27.49.125 \
-  --gateway <auto-detected> \
   --password "YourSecurePass123!" \
-  --target-disk /dev/sda \
-  --work-disk /dev/sdb \
   --uefi \
-  --skip-confirm
+  --confirm
 
 # Custom ISO
 bash install-windows.sh --iso-url "https://example.com/your-windows.iso"
@@ -134,6 +130,12 @@ bash install-windows.sh --interactive
 bash install-windows.sh --dry-run
 ```
 
+### Hetzner Cloud notes
+
+- Attach a **Volume** as workspace (ISO download). The installer picks the **largest** disk for Windows and the **second-largest** for work — never by `sda`/`sdb` letter order.
+- VirtIO storage + network drivers are always injected on KVM/Cloud.
+- Prefer **UEFI** in the Cloud Console when available; BIOS works but is more fragile.
+
 ### Command-Line Options
 
 | Option | Description | Default |
@@ -142,9 +144,10 @@ bash install-windows.sh --dry-run
 | `--gateway <GW>` | Gateway address | Auto-detected |
 | `--password <PASS>` | Administrator password | Auto-generated (16 char) |
 | `--iso-url <URL>` | Windows ISO download URL | Built-in URL |
-| `--target-disk <DEV>` | Disk for Windows install | First detected disk |
-| `--work-disk <DEV>` | Disk for temp workspace | Second detected disk |
-| `--skip-confirm` | Skip all confirmation prompts | Off |
+| `--target-disk <DEV>` | Disk for Windows install | Largest disk |
+| `--work-disk <DEV>` | Disk for temp workspace | Second-largest disk |
+| `--skip-confirm` | Skip all confirmation prompts | On when stdin is not a TTY |
+| `--confirm` | Require typing `yes` before wiping disks | Off |
 | `--uefi` | Force UEFI boot mode | Auto-detect |
 | `--bios` | Force Legacy BIOS boot mode | Auto-detect |
 | `--interactive`, `-i` | Interactive wizard | Off |
@@ -157,12 +160,13 @@ bash install-windows.sh --dry-run
 1. **Bootstrap** (`install.sh`) downloads the main installer to `/root/` and launches it
 2. **Detection** — Identifies disks, boot mode (UEFI/BIOS), network config, and gateway
 3. **Workspace** — Formats the secondary disk as temp workspace for ISO download
-4. **Download** — Downloads Windows Server 2025 ISO and (optionally) VirtIO drivers
+4. **Download** — Downloads Windows Server 2025 ISO and VirtIO drivers (required on Cloud)
 5. **Partitioning** — Creates proper partition layout on the target disk:
    - UEFI: EFI (512MB) + MSR (16MB) + Windows (rest)
    - BIOS: System Reserved (500MB) + Windows (rest)
-6. **Extraction** — Applies the Windows WIM image using wimlib
+6. **Extraction** — Applies Standard Desktop WIM image via wimlib (robust index selection)
 7. **Configuration** — Injects:
+   - VirtIO storage/network drivers for KVM/Cloud
    - `unattend.xml` — Fully unattended Windows setup
    - `setup-network.cmd` — Hetzner /32 network config (runs on first boot)
    - `post-install.cmd` — RDP, firewall, power plan, optimization

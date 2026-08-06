@@ -5,10 +5,10 @@
 # CLOUD-READY: No SCP needed. Users only need PuTTY SSH.
 # 
 # ONE-LINER INSTALL (run from Hetzner rescue via PuTTY):
-#   wget -qO- https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install.sh | bash
+#   wget -qO- https://raw.githubusercontent.com/LeilaSchooley/hetznerWindowsOSinstaller/main/install.sh | bash
 #
 # Or download and run directly:
-#   wget -O install-windows.sh https://raw.githubusercontent.com/babai834/hetznerWindowsOSinstaller/main/install-windows.sh && bash install-windows.sh
+#   wget -O install-windows.sh https://raw.githubusercontent.com/LeilaSchooley/hetznerWindowsOSinstaller/main/install-windows.sh && bash install-windows.sh
 #
 # This script handles everything:
 #   - Dependency installation
@@ -28,18 +28,22 @@
 #   --iso-url <URL>     Custom ISO download URL
 #   --target-disk <DEV> Target disk for Windows (default: auto-detect)
 #   --work-disk <DEV>   Work disk for temp files (default: auto-detect)
-#   --skip-confirm      Skip confirmation prompts
+#   --skip-confirm      Skip confirmation prompts (default when stdin is not a TTY)
+#   --confirm           Require interactive confirmation before wiping disks
 #   --uefi              Force UEFI boot mode
 #   --bios              Force Legacy BIOS boot mode
 #   --interactive       Launch interactive wizard (best for PuTTY users)
 #   --dry-run           Validate detection and configuration only
 #
 # Requirements:
-#   - Hetzner dedicated server booted into rescue mode
-#   - At least 2 physical drives
+#   - Hetzner dedicated/Cloud server booted into rescue mode
+#   - At least 2 physical drives (or Cloud disk + Volume)
 #   - Minimum 4GB RAM
 #
 # Notes:
+#   - Disks are selected by size (largest = Windows, second-largest = workspace),
+#     never by /dev/sdX letter order (Cloud often swaps sda/sdb).
+#   - VirtIO storage + network drivers are always injected (required on Cloud).
 #   - This version requires a dedicated workspace disk and does not support
 #     single-disk installs safely.
 #
@@ -49,7 +53,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="3.2.0"
+SCRIPT_VERSION="3.3.0"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -146,8 +150,27 @@ is_valid_ipv4() {
     done
 }
 
+# List physical disks as: /dev/NAME SIZE_BYTES  (largest first).
+# Never rely on kernel /dev/sdX order — Hetzner Cloud swaps sda/sdb across reboots.
 get_candidate_disks() {
     lsblk -dbno NAME,SIZE,TYPE | awk '$3 == "disk" && $2 > 0 {print "/dev/" $1 " " $2}' | sort -k2,2nr
+}
+
+# True when running under KVM/QEMU (Hetzner Cloud / most CX/CPX/CAX plans).
+is_virtual_machine() {
+    if [ -d /sys/firmware/qemu_fw_cfg ] || [ -d /sys/bus/virtio ]; then
+        return 0
+    fi
+    if grep -qiE 'QEMU|KVM|VirtualBox|VMware|Xen|Amazon|Microsoft Corporation' /sys/class/dmi/id/product_name 2>/dev/null \
+        || grep -qiE 'QEMU|KVM|Amazon|Google|Microsoft' /sys/class/dmi/id/sys_vendor 2>/dev/null; then
+        return 0
+    fi
+    if command -v systemd-detect-virt &>/dev/null; then
+        local virt
+        virt=$(systemd-detect-virt 2>/dev/null || true)
+        [ -n "$virt" ] && [ "$virt" != "none" ] && return 0
+    fi
+    return 1
 }
 
 # Returns the partition device path for a given disk and partition number.
@@ -372,27 +395,25 @@ detect_disks() {
     done
     
     if [ ${#ALL_DISKS[@]} -lt 2 ]; then
-        die "This installer currently requires 2 physical disks: one target disk and one workspace disk. Single-disk mode is not supported safely in this version."
+        die "This installer currently requires 2 physical disks: one target disk and one workspace disk (e.g. Cloud root disk + Volume). Single-disk mode is not supported safely in this version."
     fi
     
-    # Target disk selection
+    # Select by size: largest = Windows target, second-largest = workspace.
+    # On Cloud + Volume this puts ~40–300+ GB root disk as target and the Volume as work.
     if [ -z "${TARGET_DISK:-}" ]; then
-        # Use the first (usually larger/primary) disk
         TARGET_DISK="${ALL_DISKS[0]}"
+        log_detail "Auto-selected largest disk as target: $TARGET_DISK"
     fi
     
-    # Work disk selection
     if [ -z "${WORK_DISK:-}" ]; then
-        # Use the second disk for workspace
         WORK_DISK="${ALL_DISKS[1]}"
+        log_detail "Auto-selected second-largest disk as workspace: $WORK_DISK"
     fi
     
-    # Validate that target and work disks are different
     if [ "$TARGET_DISK" = "$WORK_DISK" ]; then
         die "Target disk and work disk cannot be the same device: $TARGET_DISK"
     fi
 
-    # Validate that disks actually exist
     if [ ! -b "$TARGET_DISK" ]; then
         die "Target disk does not exist: $TARGET_DISK"
     fi
@@ -403,6 +424,12 @@ detect_disks() {
     local target_size work_size
     target_size=$(lsblk -dbno SIZE "$TARGET_DISK" 2>/dev/null || echo 0)
     work_size=$(lsblk -dbno SIZE "$WORK_DISK" 2>/dev/null || echo 0)
+
+    # Warn if someone overrode disks and target is smaller than work (common sda/sdb swap mistake)
+    if [ "$target_size" -lt "$work_size" ]; then
+        log_warn "Target disk ($TARGET_DISK) is smaller than work disk ($WORK_DISK)."
+        log_warn "On Hetzner Cloud, Windows should usually go on the larger root disk."
+    fi
 
     [ "$target_size" -ge "$MIN_TARGET_DISK_BYTES" ] || \
         die "Target disk is too small for Windows Server: $TARGET_DISK ($(numfmt --to=iec "$target_size" 2>/dev/null || echo "$target_size"))"
@@ -429,8 +456,24 @@ detect_boot_mode() {
     log_detail "Boot mode: ${BOOT_MODE^^}"
 }
 
+show_admin_password() {
+    local reason="${1:-Administrator password}"
+    echo ""
+    echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${YELLOW}║  ${reason}${NC}"
+    echo -e "${YELLOW}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${YELLOW}║${NC}  Username:  ${GREEN}Administrator${NC}"
+    echo -e "${YELLOW}║${NC}  Password:  ${GREEN}${ADMIN_PASSWORD}${NC}"
+    echo -e "${YELLOW}║${NC}  RDP:       ${GREEN}${SERVER_IP:-(auto)}:3389${NC}"
+    echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "  ${CYAN}>>> COPY THIS PASSWORD NOW <<<${NC}"
+    echo -e "  ${CYAN}${ADMIN_PASSWORD}${NC}"
+    echo ""
+}
+
 generate_password() {
     # Generate a secure random password if not provided
+    PASSWORD_AUTO_GENERATED=0
     if [ -z "${ADMIN_PASSWORD:-}" ]; then
         ADMIN_PASSWORD=$(python3 - <<'PY'
 import secrets
@@ -438,7 +481,10 @@ alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%'
 print(''.join(secrets.choice(alphabet) for _ in range(16)))
 PY
 )
-        log_info "Generated administrator password: $ADMIN_PASSWORD"
+        PASSWORD_AUTO_GENERATED=1
+        show_admin_password "AUTO-GENERATED PASSWORD — SAVE THIS"
+    else
+        show_admin_password "Administrator password"
     fi
 }
 
@@ -552,8 +598,11 @@ download_virtio() {
     
     wget -O "$virtio_path" "$VIRTIO_ISO_URL" \
         --progress=bar:force:noscroll 2>&1 || {
+        if is_virtual_machine; then
+            die "VirtIO download failed (required on Hetzner Cloud / KVM)."
+        fi
         log_warn "VirtIO download failed. Continuing without VirtIO drivers."
-        log_warn "This is fine for most Hetzner hardware (non-KVM)."
+        log_warn "This is fine for most Hetzner bare-metal hardware (non-KVM)."
         VIRTIO_PATH=""
         return
     }
@@ -646,22 +695,15 @@ extract_windows() {
     
     log_detail "Found: $(basename "$wim_file")"
     
-    # List available images
+    # List available images (best-effort; never fail the install on metadata display)
     log_detail "Available Windows editions:"
-    wimlib-imagex info "$wim_file" | grep -E "^(Index|Name|Description)" | head -20 || true
+    wimlib-imagex info "$wim_file" 2>/dev/null | grep -E "^(Index|Name|Description)" | head -40 || true
     
-    # Use image index 2 by default (Standard with Desktop Experience)
-    # Index 1 = Standard Core, Index 2 = Standard, Index 3 = Datacenter Core, Index 4 = Datacenter
-    local image_index=2
+    # Prefer Standard Desktop Experience without parsing "Image Count:" (locale/format fragile).
+    # Typical Server 2025 EVAL order: 1=Standard Core, 2=Standard Desktop, 3=DC Core, 4=DC Desktop.
+    local image_index
+    image_index=$(select_windows_image_index "$wim_file")
     
-    # Check how many images exist
-    local num_images
-    num_images=$(wimlib-imagex info "$wim_file" | awk '/^Image Count:/ {print $3; exit}') || die "Failed to inspect Windows image metadata"
-    [[ "$num_images" =~ ^[0-9]+$ ]] || die "Invalid Windows image metadata in $(basename "$wim_file")"
-    if [ "${num_images:-0}" -lt 2 ]; then
-        image_index=1
-    fi
-
     wimlib-imagex info "$wim_file" "$image_index" >/dev/null 2>&1 || die "Selected Windows image index $image_index is not available"
     
     log_detail "Applying image index $image_index to $WIN_PART..."
@@ -670,30 +712,122 @@ extract_windows() {
     log_info "Windows files extracted successfully."
 }
 
+# Pick WIM index: prefer "Standard" Desktop (not Core), else hard-code 2, else 1.
+select_windows_image_index() {
+    local wim_file="$1"
+    local info_out
+    info_out=$(wimlib-imagex info "$wim_file" 2>/dev/null) || die "Failed to inspect Windows image metadata"
+
+    # Count Index: lines — more robust than "Image Count:" label parsing
+    local indexes
+    indexes=$(printf '%s\n' "$info_out" | awk '/^Index:/ {print $2}')
+    local num_images
+    num_images=$(printf '%s\n' "$indexes" | grep -c '^[0-9]\+$' || true)
+    [ "${num_images:-0}" -ge 1 ] || die "No Windows image indexes found in $(basename "$wim_file")"
+
+    # Parse Index/Name pairs and prefer Standard Desktop Experience
+    local chosen
+    chosen=$(WIM_INFO="$info_out" python3 - <<'PY'
+import os, re
+text = os.environ.get("WIM_INFO", "")
+blocks = re.split(r'(?=^Index:\s*\d+)', text, flags=re.M)
+best = None
+for block in blocks:
+    m = re.search(r'^Index:\s*(\d+)', block, re.M)
+    if not m:
+        continue
+    idx = int(m.group(1))
+    name = ""
+    nm = re.search(r'^Name:\s*(.+)$', block, re.M)
+    if nm:
+        name = nm.group(1).strip()
+    lower = name.lower()
+    # Prefer Desktop Experience; deprioritize Core
+    if "core" in lower:
+        score = 10
+    elif "standard" in lower and ("desktop" in lower or "experience" in lower):
+        score = 100
+    elif "standard" in lower:
+        score = 80
+    elif "datacenter" in lower and ("desktop" in lower or "experience" in lower):
+        score = 70
+    elif "datacenter" in lower:
+        score = 50
+    else:
+        score = 20
+    # Prefer lower index on tie (Standard usually before Datacenter)
+    key = (score, -idx)
+    if best is None or key > best[0]:
+        best = (key, idx, name)
+if best:
+    print(best[1])
+PY
+) || true
+
+    if [[ "${chosen:-}" =~ ^[0-9]+$ ]]; then
+        log_detail "Selected image index $chosen by edition name"
+        echo "$chosen"
+        return
+    fi
+
+    # Fallbacks: Standard Desktop is almost always index 2 on Server EVAL ISOs
+    if [ "$num_images" -ge 2 ]; then
+        log_detail "Falling back to image index 2 (Standard Desktop)"
+        echo 2
+    else
+        log_detail "Only one image present; using index 1"
+        echo 1
+    fi
+}
+
 inject_drivers() {
     if [ -z "${VIRTIO_PATH:-}" ] || [ ! -f "${VIRTIO_PATH:-}" ]; then
+        if is_virtual_machine; then
+            die "VirtIO drivers are required on Hetzner Cloud / KVM but were not downloaded."
+        fi
         log_info "Skipping VirtIO driver injection (not needed for bare-metal)."
         return
     fi
     
-    log_step "Injecting VirtIO drivers..."
+    log_step "Injecting VirtIO drivers (storage + network)..."
     
     local virtio_mount="/mnt/virtio"
     mkdir -p "$virtio_mount"
     mount -o loop,ro "$VIRTIO_PATH" "$virtio_mount" || {
+        if is_virtual_machine; then
+            die "Could not mount VirtIO ISO (required on Cloud/KVM)."
+        fi
         log_warn "Could not mount VirtIO ISO, skipping driver injection."
         return
     }
     
-    # Copy relevant drivers to Windows
-    local driver_dest="$MOUNT_TARGET/Windows/INF"
+    # Stage drivers where Windows Setup / PnP will pick them up on first boot
+    local driver_stage="$MOUNT_TARGET/Windows/Drivers/VirtIO"
+    mkdir -p "$driver_stage"
     local copied_driver_dirs=0
-    
-    # Find Windows Server 2025/2022 drivers (w11 or 2k22 folder)
-    for driver_dir in "$virtio_mount"/*/w11/amd64 "$virtio_mount"/*/2k22/amd64 "$virtio_mount"/*/2k25/amd64; do
-        if [ -d "$driver_dir" ]; then
-            log_detail "Copying drivers from $driver_dir"
-            cp -r "$driver_dir"/* "$driver_dest/" 2>/dev/null || log_warn "Failed to copy drivers from $driver_dir"
+
+    # Critical for Cloud: viostor (disk), vioscsi, NetKVM (network), plus balloon/viorng/vioserial
+    local packages=(viostor vioscsi NetKVM balloon viorng vioserial qxldod)
+    local pkg arch_dir
+    for pkg in "${packages[@]}"; do
+        arch_dir=""
+        for candidate in \
+            "$virtio_mount/$pkg/2k25/amd64" \
+            "$virtio_mount/$pkg/w11/amd64" \
+            "$virtio_mount/$pkg/2k22/amd64" \
+            "$virtio_mount/$pkg/2k19/amd64"; do
+            if [ -d "$candidate" ]; then
+                arch_dir="$candidate"
+                break
+            fi
+        done
+        if [ -n "$arch_dir" ]; then
+            log_detail "Copying $pkg from $arch_dir"
+            # Flatten into one DriverPaths directory (PnP searches this folder)
+            cp -r "$arch_dir"/* "$driver_stage/" 2>/dev/null || log_warn "Failed to copy $pkg drivers"
+            cp -n "$arch_dir"/*.inf "$MOUNT_TARGET/Windows/INF/" 2>/dev/null || true
+            cp -n "$arch_dir"/*.sys "$MOUNT_TARGET/Windows/System32/drivers/" 2>/dev/null || true
+            cp -n "$arch_dir"/*.cat "$MOUNT_TARGET/Windows/INF/" 2>/dev/null || true
             copied_driver_dirs=$((copied_driver_dirs + 1))
         fi
     done
@@ -702,10 +836,14 @@ inject_drivers() {
     rmdir "$virtio_mount" 2>/dev/null || true
 
     if [ "$copied_driver_dirs" -eq 0 ]; then
+        if is_virtual_machine; then
+            die "No matching VirtIO driver directories found in ISO (Cloud requires viostor + NetKVM)."
+        fi
         log_warn "No matching VirtIO driver directories were found in the ISO. Continuing without offline driver injection."
+        return
     fi
-    
-    log_info "Drivers injected."
+
+    log_info "VirtIO drivers staged ($copied_driver_dirs packages) at Windows\\Drivers\\VirtIO"
 }
 
 generate_unattend_xml() {
@@ -725,6 +863,15 @@ generate_unattend_xml() {
             <SystemLocale>en-US</SystemLocale>
             <UILanguage>en-US</UILanguage>
             <UserLocale>en-US</UserLocale>
+        </component>
+    </settings>
+    <settings pass="offlineServicing">
+        <component name="Microsoft-Windows-PnpCustomizationsNonWinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <DriverPaths>
+                <PathAndCredentials wcm:action="add" wcm:keyValue="1">
+                    <Path>C:\Windows\Drivers\VirtIO</Path>
+                </PathAndCredentials>
+            </DriverPaths>
         </component>
     </settings>
     <settings pass="specialize">
@@ -1216,41 +1363,64 @@ setup_uefi_boot() {
 setup_bios_boot() {
     log_detail "Configuring Legacy BIOS boot..."
     
-    # Mount boot partition
+    # Mount boot partition (System Reserved)
     local boot_mount="/mnt/bootpart"
     mkdir -p "$boot_mount"
     mount "$BOOT_PART" "$boot_mount" || die "Failed to mount boot partition"
     
-    # Copy boot files to the system reserved partition
     mkdir -p "$boot_mount/Boot"
     
     if [ -d "$MOUNT_TARGET/Windows/Boot/PCAT" ]; then
-        # Copy everything except BCD and BCD.LOG files (they contain stale device references)
+        # Copy everything except BCD and BCD.LOG (stale device refs → 0xc000000f)
         find "$MOUNT_TARGET/Windows/Boot/PCAT" -maxdepth 1 -type f \
             ! -iname 'BCD' ! -iname 'BCD.*' \
             -exec cp {} "$boot_mount/Boot/" \; 2>/dev/null || true
-        # Copy subdirectories
         find "$MOUNT_TARGET/Windows/Boot/PCAT" -mindepth 1 -maxdepth 1 -type d \
             -exec cp -r {} "$boot_mount/Boot/" \; 2>/dev/null || true
     fi
     
-    # Copy bootmgr (but NOT Boot/BCD — it contains stale device references)
-    cp "$MOUNT_TARGET/bootmgr" "$boot_mount/" 2>/dev/null || true
+    # bootmgr must live on the active/boot partition root
+    if [ -f "$MOUNT_TARGET/bootmgr" ]; then
+        cp "$MOUNT_TARGET/bootmgr" "$boot_mount/" || die "Failed to copy bootmgr to boot partition"
+    elif [ -f "$MOUNT_TARGET/Windows/Boot/PCAT/bootmgr" ]; then
+        cp "$MOUNT_TARGET/Windows/Boot/PCAT/bootmgr" "$boot_mount/" || die "Failed to copy bootmgr to boot partition"
+    else
+        die "bootmgr not found in applied Windows image — BIOS boot cannot be configured"
+    fi
+
+    # Also keep a copy on the Windows volume (bcdboot / recovery expect it)
+    cp "$boot_mount/bootmgr" "$MOUNT_TARGET/bootmgr" 2>/dev/null || true
     
-    # Copy boot fonts
     mkdir -p "$boot_mount/Boot/Fonts"
     cp "$MOUNT_TARGET/Windows/Boot/Fonts/"* "$boot_mount/Boot/Fonts/" 2>/dev/null || true
-    
+
+    # Critical BIOS files
+    [ -f "$boot_mount/Boot/bootmgr.exe" ] || [ -f "$boot_mount/bootmgr" ] || \
+        die "BIOS boot files incomplete after copy"
+
     umount "$boot_mount"
     rmdir "$boot_mount"
     
-    # Write MBR and NTFS VBR boot code using ms-sys.
+    # Write Windows 7+ MBR and NTFS VBR boot code (ms-sys).
     # Note: bootmgr is a PE executable, NOT MBR boot sector data — never dd it to MBR.
+    local mbr_ok=0 vbr_ok=0
     if command -v ms-sys &>/dev/null; then
-        ms-sys -7 "$TARGET_DISK" 2>/dev/null || true
-        ms-sys -n "$BOOT_PART" 2>/dev/null || true
-    else
-        log_warn "ms-sys not available. BIOS boot may require manual repair (bootsect /nt60)."
+        if ms-sys -7 "$TARGET_DISK" 2>/dev/null; then
+            mbr_ok=1
+            log_detail "Wrote Windows MBR to $TARGET_DISK"
+        fi
+        if ms-sys -n "$BOOT_PART" 2>/dev/null; then
+            vbr_ok=1
+            log_detail "Wrote NTFS VBR boot code to $BOOT_PART"
+        fi
+    fi
+
+    if [ "$mbr_ok" != "1" ] || [ "$vbr_ok" != "1" ]; then
+        log_warn "ms-sys MBR/VBR write incomplete (mbr=$mbr_ok vbr=$vbr_ok)."
+        log_warn "BCD template + first-boot bcdboot should still repair boot on many systems."
+        if is_virtual_machine; then
+            log_warn "On Hetzner Cloud, prefer UEFI (enable in Cloud Console) and re-run with --uefi."
+        fi
     fi
     
     log_info "Legacy BIOS boot configured."
@@ -1369,13 +1539,10 @@ print_completion() {
     echo -e "  After Windows finishes installing (5-15 minutes), you can"
     echo -e "  connect via RDP."
     echo ""
-    echo -e "  ${CYAN}Connection Details:${NC}"
-    echo -e "  ─────────────────────────────────"
-    echo -e "  RDP Address:   ${GREEN}${SERVER_IP}:3389${NC}"
-    echo -e "  Username:      ${GREEN}Administrator${NC}"
-    echo -e "  Password:      ${GREEN}${ADMIN_PASSWORD}${NC}"
-    echo -e "  ─────────────────────────────────"
-    echo ""
+
+    # Always print password loudly at the end (easy to miss earlier in a long log)
+    show_admin_password "FINAL CREDENTIALS — COPY BEFORE REBOOT"
+
     echo -e "  ${YELLOW}Important Notes:${NC}"
     echo -e "  • Windows may restart several times during setup"
     echo -e "  • First boot takes longer due to hardware detection"
@@ -1413,6 +1580,10 @@ CREDEOF
             log_info "Reboot skipped. Run 'reboot' when ready."
         fi
     else
+        # Give time to copy the password from the console before reboot
+        echo -e "${YELLOW}Password again: ${GREEN}${ADMIN_PASSWORD}${NC}"
+        echo -e "${CYAN}Rebooting in 20 seconds — copy the password above now...${NC}"
+        sleep 20
         log_info "Rebooting server..."
         reboot
     fi
@@ -1430,7 +1601,12 @@ parse_args() {
     ADMIN_PASSWORD=""
     TARGET_DISK=""
     WORK_DISK=""
-    SKIP_CONFIRM=0
+    # Non-interactive by default for piped one-liners; --confirm or a TTY wizard can override.
+    if [ -t 0 ]; then
+        SKIP_CONFIRM=0
+    else
+        SKIP_CONFIRM=1
+    fi
     FORCE_UEFI=""
     FORCE_BIOS=""
     INTERACTIVE_MODE=""
@@ -1458,6 +1634,8 @@ parse_args() {
                 WORK_DISK="$2"; shift 2 ;;
             --skip-confirm)
                 SKIP_CONFIRM=1; shift ;;
+            --confirm)
+                SKIP_CONFIRM=0; shift ;;
             --uefi)
                 [ -n "${FORCE_BIOS:-}" ] && die "Cannot use both --uefi and --bios."
                 FORCE_UEFI=1; shift ;;
@@ -1467,7 +1645,7 @@ parse_args() {
             --single-disk)
                 die "--single-disk is not supported safely in this version. Use a second disk for workspace." ;;
             --interactive|-i)
-                INTERACTIVE_MODE=1; shift ;;
+                INTERACTIVE_MODE=1; SKIP_CONFIRM=0; shift ;;
             --dry-run)
                 DRY_RUN=1; SKIP_CONFIRM=1; shift ;;
             --help|-h)
@@ -1478,9 +1656,10 @@ parse_args() {
                 echo "  --gateway <GW>      Gateway address (auto-detected)"
                 echo "  --password <PASS>   Administrator password (auto-generated)"
                 echo "  --iso-url <URL>     Windows ISO download URL"
-                echo "  --target-disk <DEV> Target disk for Windows (e.g., /dev/sda)"
-                echo "  --work-disk <DEV>   Work disk for temp files (e.g., /dev/sdb)"
-                echo "  --skip-confirm      Skip all confirmation prompts"
+                echo "  --target-disk <DEV> Target disk for Windows (largest disk if omitted)"
+                echo "  --work-disk <DEV>   Work disk for temp files (second-largest if omitted)"
+                echo "  --skip-confirm      Skip all confirmation prompts (default if stdin is not a TTY)"
+                echo "  --confirm           Require typing 'yes' before wiping disks"
                 echo "  --uefi              Force UEFI boot mode"
                 echo "  --bios              Force Legacy BIOS boot mode"
                 echo "  --single-disk       Not supported safely in this version"
