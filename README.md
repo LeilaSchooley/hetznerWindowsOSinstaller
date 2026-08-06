@@ -78,6 +78,10 @@ No files to download to your PC. No SCP. No uploads. Just one SSH command.
 - **Hetzner Network Ready** — Auto-configures /32 point-to-point routing, static IP, Hetzner DNS
 - **UEFI + Legacy BIOS** — Auto-detects boot mode and configures accordingly
 - **Two-Disk Workflow** — Uses one disk for Windows and one disk for workspace/downloads
+- **Stable disk IDs** — Resume stores `/dev/disk/by-id` so `sda`/`sdb` letter swaps cannot retarget disks
+- **Equal-size guard** — Refuses ambiguous auto-select when top disks are the same size
+- **VirtIO boot-start** — Registers `viostor`/`vioscsi` in the offline SYSTEM hive (Cloud-safe)
+- **UEFI on Cloud** — Requires UEFI for KVM unless `--bios` is passed explicitly
 - **RDP Pre-configured** — Remote Desktop enabled and firewall rules applied on first boot
 - **Built-in Network Repair** — `C:\fix-network.cmd` auto-placed on Windows drive for KVM use
 - **Unattended Install** — Full OOBE bypass, auto-login for setup, and post-install hardening
@@ -160,8 +164,9 @@ bash install-windows.sh --dry-run
 ### Hetzner Cloud notes
 
 - Attach a **Volume** as workspace (ISO download). The installer picks the **largest** disk for Windows and the **second-largest** for work — never by `sda`/`sdb` letter order.
-- VirtIO storage + network drivers are always injected on KVM/Cloud.
-- Prefer **UEFI** in the Cloud Console when available; BIOS works but is more fragile.
+- VirtIO storage + network drivers are injected and registered boot-start on KVM/Cloud (`viostor` + `NetKVM` required).
+- **UEFI is required** on Cloud/KVM (enable in Cloud Console). Pass `--bios` only if you knowingly need Legacy BIOS.
+- If the two largest disks are the same size, pass `--target-disk` / `--work-disk` (prefer `/dev/disk/by-id/...`).
 
 ### Command-Line Options
 

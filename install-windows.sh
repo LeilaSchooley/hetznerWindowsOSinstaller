@@ -48,7 +48,10 @@
 # Notes:
 #   - Disks are selected by size (largest = Windows, second-largest = workspace),
 #     never by /dev/sdX letter order (Cloud often swaps sda/sdb).
-#   - VirtIO storage + network drivers are always injected (required on Cloud).
+#   - Resume state stores /dev/disk/by-id paths so letter swaps cannot retarget disks.
+#   - Equal-size top disks refuse auto-select (require --target-disk / --work-disk).
+#   - VirtIO storage + network drivers are injected and registered boot-start (Cloud).
+#   - Cloud/KVM requires UEFI unless --bios is passed explicitly.
 #   - This version requires a dedicated workspace disk and does not support
 #     single-disk installs safely.
 #   - Progress is saved to /root/.hetzner-win-install-state for resume.
@@ -59,7 +62,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="3.4.0"
+SCRIPT_VERSION="3.5.0"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -117,6 +120,8 @@ set_stage() {
         echo "STATE_VERSION=$SCRIPT_VERSION"
         echo "TARGET_DISK=${TARGET_DISK:-}"
         echo "WORK_DISK=${WORK_DISK:-}"
+        echo "TARGET_DISK_ID=${TARGET_DISK_ID:-}"
+        echo "WORK_DISK_ID=${WORK_DISK_ID:-}"
         echo "SERVER_IP=${SERVER_IP:-}"
         echo "GATEWAY=${GATEWAY:-}"
         echo "BOOT_MODE=${BOOT_MODE:-}"
@@ -134,6 +139,8 @@ clear_state() {
     SKIP_WORKSPACE_WIPE=0
     SKIP_PARTITION=0
     SKIP_WIM_APPLY=0
+    TARGET_DISK_ID=""
+    WORK_DISK_ID=""
     log_info "Cleared install state ($STATE_FILE); full reinstall forced."
 }
 
@@ -148,7 +155,7 @@ load_state() {
         key="${line%%=*}"
         val="${line#*=}"
         case "$key" in
-            STAGE|TARGET_DISK|WORK_DISK|SERVER_IP|GATEWAY|BOOT_MODE|ADMIN_PASSWORD|ISO_URL|STATE_VERSION|UPDATED)
+            STAGE|TARGET_DISK|WORK_DISK|TARGET_DISK_ID|WORK_DISK_ID|SERVER_IP|GATEWAY|BOOT_MODE|ADMIN_PASSWORD|ISO_URL|STATE_VERSION|UPDATED)
                 printf -v "$key" '%s' "$val"
                 ;;
         esac
@@ -226,6 +233,58 @@ is_valid_ipv4() {
 # Never rely on kernel /dev/sdX order — Hetzner Cloud swaps sda/sdb across reboots.
 get_candidate_disks() {
     lsblk -dbno NAME,SIZE,TYPE | awk '$3 == "disk" && $2 > 0 {print "/dev/" $1 " " $2}' | sort -k2,2nr
+}
+
+# Stable identity for a block device (prefer /dev/disk/by-id over sdX letters).
+disk_stable_id() {
+    local disk="$1"
+    local real candidate base score best="" best_score=-1
+    real=$(readlink -f "$disk" 2>/dev/null || echo "$disk")
+
+    shopt -s nullglob
+    for candidate in /dev/disk/by-id/*; do
+        base=$(basename "$candidate")
+        [[ "$base" == *-part* ]] && continue
+        [ "$(readlink -f "$candidate" 2>/dev/null || true)" = "$real" ] || continue
+        score=20
+        case "$base" in
+            wwn-*) score=100 ;;
+            nvme-eui.*|nvme-*) score=90 ;;
+            scsi-*) score=80 ;;
+            virtio-*) score=75 ;;
+            ata-*) score=70 ;;
+            *) score=30 ;;
+        esac
+        if [ "$score" -gt "$best_score" ]; then
+            best_score=$score
+            best=$candidate
+        fi
+    done
+    shopt -u nullglob
+
+    if [ -n "$best" ]; then
+        echo "$best"
+    else
+        echo "$real"
+    fi
+}
+
+# Resolve /dev/sdX, /dev/nvmeXnY, or /dev/disk/by-id/... to a canonical block path.
+resolve_disk_device() {
+    local spec="$1"
+    local resolved
+    [ -n "$spec" ] || return 1
+    if [ -b "$spec" ] || [ -e "$spec" ]; then
+        resolved=$(readlink -f "$spec" 2>/dev/null || echo "$spec")
+        [ -b "$resolved" ] || return 1
+        echo "$resolved"
+        return 0
+    fi
+    return 1
+}
+
+disk_size_bytes() {
+    lsblk -dbno SIZE "$1" 2>/dev/null || echo 0
 }
 
 # True when running under KVM/QEMU (Hetzner Cloud / most CX/CPX/CAX plans).
@@ -669,30 +728,89 @@ detect_disks() {
     
     log_info "Detected disks:"
     for disk in "${ALL_DISKS[@]}"; do
-        local size
+        local size model stable
         size=$(lsblk -dpno SIZE "$disk" 2>/dev/null || echo "unknown")
-        local model
         model=$(lsblk -dpno MODEL "$disk" 2>/dev/null || echo "unknown")
-        log_detail "$disk - Size: $size - Model: $model"
+        stable=$(disk_stable_id "$disk")
+        log_detail "$disk - Size: $size - Model: $model - ID: $stable"
     done
     
     if [ ${#ALL_DISKS[@]} -lt 2 ]; then
         die "This installer currently requires 2 physical disks: one target disk and one workspace disk (e.g. Cloud root disk + Volume). Single-disk mode is not supported safely in this version."
     fi
-    
+
+    # Prefer stable by-id from resume state (survives sda/sdb letter swaps).
+    local resolved
+    if [ -n "${TARGET_DISK_ID:-}" ]; then
+        if resolved=$(resolve_disk_device "$TARGET_DISK_ID"); then
+            if [ -n "${TARGET_DISK:-}" ] && [ "$(readlink -f "$TARGET_DISK" 2>/dev/null || true)" != "$resolved" ]; then
+                log_warn "Target path changed after reboot (${TARGET_DISK} → ${resolved}); using stable id."
+            fi
+            TARGET_DISK="$resolved"
+            log_detail "Resolved target from stable id: $TARGET_DISK_ID → $TARGET_DISK"
+        else
+            log_warn "Saved TARGET_DISK_ID not found ($TARGET_DISK_ID); falling back to path/auto-select."
+            TARGET_DISK_ID=""
+        fi
+    fi
+    if [ -n "${WORK_DISK_ID:-}" ]; then
+        if resolved=$(resolve_disk_device "$WORK_DISK_ID"); then
+            if [ -n "${WORK_DISK:-}" ] && [ "$(readlink -f "$WORK_DISK" 2>/dev/null || true)" != "$resolved" ]; then
+                log_warn "Work path changed after reboot (${WORK_DISK} → ${resolved}); using stable id."
+            fi
+            WORK_DISK="$resolved"
+            log_detail "Resolved work from stable id: $WORK_DISK_ID → $WORK_DISK"
+        else
+            log_warn "Saved WORK_DISK_ID not found ($WORK_DISK_ID); falling back to path/auto-select."
+            WORK_DISK_ID=""
+        fi
+    fi
+
+    # Resolve explicit /dev paths or by-id strings from CLI / stale state paths.
+    if [ -n "${TARGET_DISK:-}" ]; then
+        resolved=$(resolve_disk_device "$TARGET_DISK") || die "Target disk does not exist: $TARGET_DISK"
+        TARGET_DISK="$resolved"
+    fi
+    if [ -n "${WORK_DISK:-}" ]; then
+        resolved=$(resolve_disk_device "$WORK_DISK") || die "Work disk does not exist: $WORK_DISK"
+        WORK_DISK="$resolved"
+    fi
+
+    local size0 size1
+    size0=$(disk_size_bytes "${ALL_DISKS[0]}")
+    size1=$(disk_size_bytes "${ALL_DISKS[1]}")
+
     # Select by size: largest = Windows target, second-largest = workspace.
-    # On Cloud + Volume this puts ~40–300+ GB root disk as target and the Volume as work.
-    if [ -z "${TARGET_DISK:-}" ]; then
+    # Refuse ambiguous equal-size auto-select (would risk wiping the wrong disk).
+    if [ -z "${TARGET_DISK:-}" ] && [ -z "${WORK_DISK:-}" ]; then
+        if [ "$size0" -eq "$size1" ]; then
+            die "Top two disks are the same size ($(numfmt --to=iec "$size0" 2>/dev/null || echo "$size0")). Refusing auto-select to avoid wiping the wrong disk. Pass --target-disk and --work-disk explicitly (prefer /dev/disk/by-id/...)."
+        fi
         TARGET_DISK="${ALL_DISKS[0]}"
-        log_detail "Auto-selected largest disk as target: $TARGET_DISK"
-    fi
-    
-    if [ -z "${WORK_DISK:-}" ]; then
         WORK_DISK="${ALL_DISKS[1]}"
+        log_detail "Auto-selected largest disk as target: $TARGET_DISK"
         log_detail "Auto-selected second-largest disk as workspace: $WORK_DISK"
+    elif [ -z "${TARGET_DISK:-}" ]; then
+        for disk in "${ALL_DISKS[@]}"; do
+            if [ "$(readlink -f "$disk")" != "$(readlink -f "$WORK_DISK")" ]; then
+                TARGET_DISK="$disk"
+                break
+            fi
+        done
+        [ -n "${TARGET_DISK:-}" ] || die "Could not auto-select a target disk distinct from work disk $WORK_DISK"
+        log_detail "Auto-selected target disk (excluding work): $TARGET_DISK"
+    elif [ -z "${WORK_DISK:-}" ]; then
+        for disk in "${ALL_DISKS[@]}"; do
+            if [ "$(readlink -f "$disk")" != "$(readlink -f "$TARGET_DISK")" ]; then
+                WORK_DISK="$disk"
+                break
+            fi
+        done
+        [ -n "${WORK_DISK:-}" ] || die "Could not auto-select a work disk distinct from target disk $TARGET_DISK"
+        log_detail "Auto-selected work disk (excluding target): $WORK_DISK"
     fi
     
-    if [ "$TARGET_DISK" = "$WORK_DISK" ]; then
+    if [ "$(readlink -f "$TARGET_DISK")" = "$(readlink -f "$WORK_DISK")" ]; then
         die "Target disk and work disk cannot be the same device: $TARGET_DISK"
     fi
 
@@ -703,9 +821,12 @@ detect_disks() {
         die "Work disk does not exist: $WORK_DISK"
     fi
 
+    TARGET_DISK_ID=$(disk_stable_id "$TARGET_DISK")
+    WORK_DISK_ID=$(disk_stable_id "$WORK_DISK")
+
     local target_size work_size
-    target_size=$(lsblk -dbno SIZE "$TARGET_DISK" 2>/dev/null || echo 0)
-    work_size=$(lsblk -dbno SIZE "$WORK_DISK" 2>/dev/null || echo 0)
+    target_size=$(disk_size_bytes "$TARGET_DISK")
+    work_size=$(disk_size_bytes "$WORK_DISK")
 
     # Warn if someone overrode disks and target is smaller than work (common sda/sdb swap mistake)
     if [ "$target_size" -lt "$work_size" ]; then
@@ -718,8 +839,8 @@ detect_disks() {
     [ "$work_size" -ge "$MIN_WORK_DISK_BYTES" ] || \
         die "Work disk is too small for ISO workspace: $WORK_DISK ($(numfmt --to=iec "$work_size" 2>/dev/null || echo "$work_size"))"
 
-    log_detail "Target disk (Windows): $TARGET_DISK"
-    log_detail "Work disk (temp):      $WORK_DISK"
+    log_detail "Target disk (Windows): $TARGET_DISK ($TARGET_DISK_ID)"
+    log_detail "Work disk (temp):      $WORK_DISK ($WORK_DISK_ID)"
 }
 
 detect_boot_mode() {
@@ -729,6 +850,16 @@ detect_boot_mode() {
         BOOT_MODE="uefi"
     elif [ -n "${FORCE_BIOS:-}" ]; then
         BOOT_MODE="bios"
+        if is_virtual_machine; then
+            log_warn "Legacy BIOS forced on Cloud/KVM via --bios. UEFI is strongly recommended."
+        fi
+    elif is_virtual_machine; then
+        if [ -d /sys/firmware/efi ]; then
+            BOOT_MODE="uefi"
+            log_detail "Cloud/KVM detected — using UEFI"
+        else
+            die "Cloud/KVM detected but firmware is Legacy BIOS. Enable UEFI in the Hetzner Cloud Console, reboot to rescue, and re-run. To override knowingly, pass --bios."
+        fi
     elif [ -d /sys/firmware/efi ]; then
         BOOT_MODE="uefi"
     else
@@ -966,7 +1097,9 @@ confirm_settings() {
     echo -e "  Gateway:          ${GREEN}$GATEWAY${NC}"
     echo -e "  Admin Password:   ${GREEN}$ADMIN_PASSWORD${NC}"
     echo -e "  Target Disk:      ${GREEN}$TARGET_DISK${NC}"
+    echo -e "  Target Disk ID:   ${GREEN}${TARGET_DISK_ID:-n/a}${NC}"
     echo -e "  Work Disk:        ${GREEN}$WORK_DISK${NC}"
+    echo -e "  Work Disk ID:     ${GREEN}${WORK_DISK_ID:-n/a}${NC}"
     echo -e "  Boot Mode:        ${GREEN}${BOOT_MODE^^}${NC}"
     echo -e "  Network Mode:     ${GREEN}${NETWORK_MODE}${NC}"
     echo -e "  Subnet Mask:      ${GREEN}${SUBNET_MASK}${NC}"
@@ -1319,6 +1452,7 @@ inject_drivers() {
     local driver_stage="$MOUNT_TARGET/Windows/Drivers/VirtIO"
     mkdir -p "$driver_stage"
     local copied_driver_dirs=0
+    local have_viostor=0 have_vioscsi=0 have_netkvm=0
 
     # Critical for Cloud: viostor (disk), vioscsi, NetKVM (network), plus balloon/viorng/vioserial
     local packages=(viostor vioscsi NetKVM balloon viorng vioserial qxldod)
@@ -1343,6 +1477,11 @@ inject_drivers() {
             cp -n "$arch_dir"/*.sys "$MOUNT_TARGET/Windows/System32/drivers/" 2>/dev/null || true
             cp -n "$arch_dir"/*.cat "$MOUNT_TARGET/Windows/INF/" 2>/dev/null || true
             copied_driver_dirs=$((copied_driver_dirs + 1))
+            case "$pkg" in
+                viostor) have_viostor=1 ;;
+                vioscsi) have_vioscsi=1 ;;
+                NetKVM) have_netkvm=1 ;;
+            esac
         fi
     done
     
@@ -1357,7 +1496,154 @@ inject_drivers() {
         return
     fi
 
+    # On Cloud, storage + network packages are mandatory — not "any package copied".
+    if is_virtual_machine; then
+        [ "$have_viostor" = "1" ] || die "VirtIO viostor (storage) drivers were not found/copied — Cloud boot would fail."
+        [ "$have_netkvm" = "1" ] || die "VirtIO NetKVM (network) drivers were not found/copied — RDP/network would fail on Cloud."
+        local drivers_dir="$MOUNT_TARGET/Windows/System32/drivers"
+        if ! compgen -G "$drivers_dir/[Vv]iostor.sys" >/dev/null; then
+            die "viostor.sys missing after copy ($drivers_dir)."
+        fi
+        if ! compgen -G "$drivers_dir/[Nn]et[Kk][Vv][Mm].sys" >/dev/null; then
+            die "netkvm.sys missing after copy ($drivers_dir)."
+        fi
+    fi
+
+    register_virtio_boot_services "$have_viostor" "$have_vioscsi" "$have_netkvm"
+
     log_info "VirtIO drivers staged ($copied_driver_dirs packages) at Windows\\Drivers\\VirtIO"
+}
+
+# Ensure a Services\<name> key exists (idempotent across resume re-runs).
+hivex_ensure_service_key() {
+    local hive="$1" name="$2"
+    if printf 'cd \\ControlSet001\\Services\\%s\nquit\n' "$name" | hivexsh "$hive" >/dev/null 2>&1; then
+        return 0
+    fi
+    printf 'cd \\ControlSet001\\Services\nadd %s\ncommit\nquit\n' "$name" | hivexsh -w "$hive" >/dev/null 2>&1
+}
+
+# Write common service values; Start: 0=boot, 3=demand.
+hivex_set_driver_service() {
+    local hive="$1" name="$2" start="$3" group="$4" sysfile="$5"
+    local tmp
+    tmp=$(mktemp /tmp/virtio-svc.XXXXXX)
+    {
+        echo "cd \\ControlSet001\\Services\\${name}"
+        cat <<EOF
+setval 1
+ErrorControl
+dword:00000001
+setval 1
+Group
+string:${group}
+setval 1
+Start
+dword:${start}
+setval 1
+Type
+dword:00000001
+setval 1
+ImagePath
+expand:\\SystemRoot\\System32\\drivers\\${sysfile}
+commit
+quit
+EOF
+    } > "$tmp"
+    hivexsh -w "$hive" < "$tmp" >/dev/null 2>&1
+    local rc=$?
+    rm -f "$tmp"
+    return $rc
+}
+
+hivex_set_storport_params() {
+    local hive="$1" name="$2"
+    local tmp
+    tmp=$(mktemp /tmp/virtio-params.XXXXXX)
+    # Best-effort: create Parameters/PnpInterface when missing, then set BusType.
+    {
+        cat <<EOF
+cd \\ControlSet001\\Services\\${name}
+add Parameters
+commit
+quit
+EOF
+    } > "$tmp"
+    hivexsh -w "$hive" < "$tmp" >/dev/null 2>&1 || true
+    {
+        cat <<EOF
+cd \\ControlSet001\\Services\\${name}\\Parameters
+setval 1
+BusType
+dword:00000001
+add PnpInterface
+commit
+quit
+EOF
+    } > "$tmp"
+    hivexsh -w "$hive" < "$tmp" >/dev/null 2>&1 || true
+    {
+        cat <<EOF
+cd \\ControlSet001\\Services\\${name}\\Parameters\\PnpInterface
+setval 1
+5
+dword:00000001
+commit
+quit
+EOF
+    } > "$tmp"
+    hivexsh -w "$hive" < "$tmp" >/dev/null 2>&1 || true
+    rm -f "$tmp"
+}
+
+# Register VirtIO kernel drivers in the offline SYSTEM hive so storage is
+# boot-critical before PnP/offlineServicing finishes (avoids INACCESSIBLE_BOOT_DEVICE).
+register_virtio_boot_services() {
+    local have_viostor="${1:-0}" have_vioscsi="${2:-0}" have_netkvm="${3:-0}"
+    local hive="$MOUNT_TARGET/Windows/System32/config/SYSTEM"
+    local ok=1
+
+    if [ ! -f "$hive" ]; then
+        if is_virtual_machine; then
+            die "SYSTEM hive missing; cannot register VirtIO boot drivers."
+        fi
+        log_warn "SYSTEM hive missing; skipped VirtIO service registration."
+        return
+    fi
+
+    if ! command -v hivexsh &>/dev/null; then
+        if is_virtual_machine; then
+            die "hivexsh not available; cannot register VirtIO boot drivers on Cloud."
+        fi
+        log_warn "hivexsh not available; skipped VirtIO service registration."
+        return
+    fi
+
+    log_detail "Registering VirtIO services in offline SYSTEM hive (boot-start storage)..."
+
+    if [ "$have_viostor" = "1" ]; then
+        hivex_ensure_service_key "$hive" "viostor" || ok=0
+        hivex_set_driver_service "$hive" "viostor" "00000000" "SCSI miniport" "viostor.sys" || ok=0
+        hivex_set_storport_params "$hive" "viostor"
+    fi
+    if [ "$have_vioscsi" = "1" ]; then
+        hivex_ensure_service_key "$hive" "vioscsi" || ok=0
+        hivex_set_driver_service "$hive" "vioscsi" "00000000" "SCSI miniport" "vioscsi.sys" || ok=0
+        hivex_set_storport_params "$hive" "vioscsi"
+    fi
+    if [ "$have_netkvm" = "1" ]; then
+        hivex_ensure_service_key "$hive" "netkvm" || ok=0
+        hivex_set_driver_service "$hive" "netkvm" "00000003" "NDIS" "netkvm.sys" || ok=0
+    fi
+
+    if [ "$ok" = "1" ]; then
+        log_info "VirtIO services registered in SYSTEM hive (viostor/vioscsi boot-start)."
+    else
+        if is_virtual_machine; then
+            die "Failed to register VirtIO services in SYSTEM hive (required on Cloud)."
+        fi
+        log_warn "VirtIO SYSTEM hive registration failed; relying on DriverPaths/PnP only."
+    fi
 }
 
 generate_unattend_xml() {
@@ -2079,6 +2365,9 @@ Gateway:      ${GATEWAY}
 DNS:          ${DNS_PRIMARY}, ${DNS_SECONDARY}
 Boot Mode:    ${BOOT_MODE^^}
 Target Disk:  ${TARGET_DISK}
+Target ID:    ${TARGET_DISK_ID:-n/a}
+Work Disk:    ${WORK_DISK}
+Work ID:      ${WORK_DISK_ID:-n/a}
 ===========================================
 CREDEOF
     chmod 600 /root/windows-credentials.txt
@@ -2121,6 +2410,8 @@ parse_args() {
     ADMIN_PASSWORD=""
     TARGET_DISK=""
     WORK_DISK=""
+    TARGET_DISK_ID=""
+    WORK_DISK_ID=""
     # Non-interactive by default for piped one-liners; --confirm or a TTY wizard can override.
     if [ -t 0 ]; then
         SKIP_CONFIRM=0
@@ -2200,12 +2491,12 @@ parse_args() {
                 echo "  --gateway <GW>      Gateway address (auto-detected)"
                 echo "  --password <PASS>   Administrator password (auto-generated)"
                 echo "  --iso-url <URL>     Windows ISO download URL"
-                echo "  --target-disk <DEV> Target disk for Windows (largest disk if omitted)"
-                echo "  --work-disk <DEV>   Work disk for temp files (second-largest if omitted)"
+                echo "  --target-disk <DEV> Target disk for Windows (largest disk if omitted; prefer by-id)"
+                echo "  --work-disk <DEV>   Work disk for temp files (second-largest if omitted; prefer by-id)"
                 echo "  --skip-confirm      Skip all confirmation prompts (default if stdin is not a TTY)"
                 echo "  --confirm           Require typing 'yes' before wiping disks"
                 echo "  --uefi              Force UEFI boot mode"
-                echo "  --bios              Force Legacy BIOS boot mode"
+                echo "  --bios              Force Legacy BIOS (required override on Cloud without UEFI)"
                 echo "  --single-disk       Not supported safely in this version"
                 echo "  --interactive, -i   Launch interactive wizard"
                 echo "  --dry-run           Validate detection and configuration only"
@@ -2251,8 +2542,14 @@ main() {
         [ -n "$cli_server_ip" ] && SERVER_IP="$cli_server_ip"
         [ -n "$cli_gateway" ] && GATEWAY="$cli_gateway"
         [ -n "$cli_password" ] && ADMIN_PASSWORD="$cli_password"
-        [ -n "$cli_target" ] && TARGET_DISK="$cli_target"
-        [ -n "$cli_work" ] && WORK_DISK="$cli_work"
+        if [ -n "$cli_target" ]; then
+            TARGET_DISK="$cli_target"
+            TARGET_DISK_ID=""  # re-resolve; do not keep stale by-id from prior selection
+        fi
+        if [ -n "$cli_work" ]; then
+            WORK_DISK="$cli_work"
+            WORK_DISK_ID=""
+        fi
         # parse_args always sets ISO_URL to default; only override state when user passed --iso-url
         # Detect via: if state had a custom URL and CLI is still default, keep state.
         if [ "$cli_iso_url" != "$DEFAULT_ISO_URL" ]; then
@@ -2267,6 +2564,9 @@ main() {
     
     if [ "${INTERACTIVE_MODE:-}" = "1" ]; then
         interactive_wizard
+        # Wizard picks live /dev paths; clear any resumed by-id so detect_disks recomputes.
+        TARGET_DISK_ID=""
+        WORK_DISK_ID=""
     fi
     
     progress_step 2 "Detection"
