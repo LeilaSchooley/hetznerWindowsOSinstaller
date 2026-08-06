@@ -20,6 +20,29 @@ That's it. Everything is downloaded and executed automatically.
 wget -qO- https://raw.githubusercontent.com/LeilaSchooley/hetznerWindowsOSinstaller/main/install.sh | bash -s -- --password "YourPass123!"
 ```
 
+### Force Full Reinstall / Clear Resume State
+
+```bash
+wget -qO- https://raw.githubusercontent.com/LeilaSchooley/hetznerWindowsOSinstaller/main/install.sh | bash -s -- --force
+```
+
+### Optional Telegram / Discord Notify (on success, before reboot)
+
+```bash
+wget -qO- https://raw.githubusercontent.com/LeilaSchooley/hetznerWindowsOSinstaller/main/install.sh | bash -s -- \
+  --telegram-token "BOT_TOKEN" --telegram-chat "CHAT_ID"
+
+# or
+wget -qO- https://raw.githubusercontent.com/LeilaSchooley/hetznerWindowsOSinstaller/main/install.sh | bash -s -- \
+  --discord-webhook "https://discord.com/api/webhooks/..."
+```
+
+### Check Version
+
+```bash
+wget -qO- https://raw.githubusercontent.com/LeilaSchooley/hetznerWindowsOSinstaller/main/install-windows.sh | bash -s -- --version
+```
+
 ### Interactive Wizard (Recommended for First-Time Users)
 
 ```bash
@@ -58,6 +81,10 @@ No files to download to your PC. No SCP. No uploads. Just one SSH command.
 - **RDP Pre-configured** — Remote Desktop enabled and firewall rules applied on first boot
 - **Built-in Network Repair** — `C:\fix-network.cmd` auto-placed on Windows drive for KVM use
 - **Unattended Install** — Full OOBE bypass, auto-login for setup, and post-install hardening
+- **Self-healing deps** — apt with retries, Debian `.deb` fallback, then wimlib source build
+- **Resume support** — state file + log; skips workspace wipe / WIM apply when safe (`--force` to reset)
+- **Pre-flight checks** — RAM, disks, network/DNS, Cloud vs Dedicated detection
+- **Optional notify** — Telegram / Discord message with RDP credentials on success
 
 ## File Structure
 
@@ -152,6 +179,11 @@ bash install-windows.sh --dry-run
 | `--bios` | Force Legacy BIOS boot mode | Auto-detect |
 | `--interactive`, `-i` | Interactive wizard | Off |
 | `--dry-run` | Validate detection and config only | Off |
+| `--force`, `--clean` | Clear resume state and force full wipe/reinstall | Off |
+| `--version` | Print installer version and exit | — |
+| `--telegram-token` | Telegram bot token (or `TELEGRAM_BOT_TOKEN`) | Off |
+| `--telegram-chat` | Telegram chat id (or `TELEGRAM_CHAT_ID`) | Off |
+| `--discord-webhook` | Discord webhook URL (or `DISCORD_WEBHOOK_URL`) | Off |
 
 ---
 

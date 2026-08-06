@@ -34,6 +34,11 @@
 #   --bios              Force Legacy BIOS boot mode
 #   --interactive       Launch interactive wizard (best for PuTTY users)
 #   --dry-run           Validate detection and configuration only
+#   --force / --clean   Clear resume state and force full wipe/reinstall
+#   --version           Print SCRIPT_VERSION and exit
+#   --telegram-token    Telegram bot token (or TELEGRAM_BOT_TOKEN)
+#   --telegram-chat     Telegram chat id (or TELEGRAM_CHAT_ID)
+#   --discord-webhook   Discord webhook URL (or DISCORD_WEBHOOK_URL)
 #
 # Requirements:
 #   - Hetzner dedicated/Cloud server booted into rescue mode
@@ -46,6 +51,7 @@
 #   - VirtIO storage + network drivers are always injected (required on Cloud).
 #   - This version requires a dedicated workspace disk and does not support
 #     single-disk installs safely.
+#   - Progress is saved to /root/.hetzner-win-install-state for resume.
 #
 ###############################################################################
 
@@ -53,7 +59,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="3.3.0"
+SCRIPT_VERSION="3.4.0"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -64,6 +70,10 @@ HETZNER_ISO_MIRROR_URL="https://download.hetzner.com/bootimages/windows/SW_DVD9_
 
 # VirtIO drivers ISO (Red Hat signed, for Hetzner's KVM/QEMU if needed)
 VIRTIO_ISO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
+
+# wimlib source fallback when apt has no wimtools package
+WIMLIB_SRC_URL="https://wimlib.net/downloads/wimlib-1.14.4.tar.gz"
+DEBIAN_WIMLIB_POOL="https://deb.debian.org/debian/pool/main/w/wimlib"
 
 # Hetzner DNS servers
 DNS_PRIMARY="185.12.64.1"
@@ -77,6 +87,10 @@ MOUNT_ISO="/mnt/iso"
 MOUNT_WORK="/mnt/work"
 MOUNT_TARGET="/mnt/target"
 
+# Persist progress across re-runs in the same rescue session
+STATE_FILE="/root/.hetzner-win-install-state"
+LOG_FILE="/root/install.log"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -86,6 +100,62 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # ===================== Functions =====================
+
+setup_logging() {
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    # Mirror all stdout/stderr to the log while keeping console colors
+    exec > >(tee -a "$LOG_FILE") 2>&1
+    log_info "Logging to $LOG_FILE (installer v${SCRIPT_VERSION})"
+}
+
+set_stage() {
+    local stage="$1"
+    {
+        echo "STAGE=$stage"
+        echo "UPDATED=$(date -Iseconds 2>/dev/null || date)"
+        echo "STATE_VERSION=$SCRIPT_VERSION"
+        echo "TARGET_DISK=${TARGET_DISK:-}"
+        echo "WORK_DISK=${WORK_DISK:-}"
+        echo "SERVER_IP=${SERVER_IP:-}"
+        echo "GATEWAY=${GATEWAY:-}"
+        echo "BOOT_MODE=${BOOT_MODE:-}"
+        echo "ADMIN_PASSWORD=${ADMIN_PASSWORD:-}"
+        echo "ISO_URL=${ISO_URL:-}"
+    } > "$STATE_FILE"
+    chmod 600 "$STATE_FILE" 2>/dev/null || true
+    log_detail "Checkpoint: $stage"
+}
+
+clear_state() {
+    rm -f "$STATE_FILE"
+    STAGE=""
+    RESUME_MODE=0
+    SKIP_WORKSPACE_WIPE=0
+    SKIP_PARTITION=0
+    SKIP_WIM_APPLY=0
+    log_info "Cleared install state ($STATE_FILE); full reinstall forced."
+}
+
+load_state() {
+    if [ ! -f "$STATE_FILE" ]; then
+        return 0
+    fi
+    # Import only known keys — never source raw file (avoids clobbering SCRIPT_VERSION).
+    local key val
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[A-Z_]+= ]] || continue
+        key="${line%%=*}"
+        val="${line#*=}"
+        case "$key" in
+            STAGE|TARGET_DISK|WORK_DISK|SERVER_IP|GATEWAY|BOOT_MODE|ADMIN_PASSWORD|ISO_URL|STATE_VERSION|UPDATED)
+                printf -v "$key" '%s' "$val"
+                ;;
+        esac
+    done < "$STATE_FILE"
+    RESUME_MODE=1
+    log_info "Found previous state ($STATE_FILE): STAGE=${STAGE:-unknown}"
+}
 
 log_info()    { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
@@ -296,31 +366,241 @@ interactive_wizard() {
     echo ""
 }
 
+# Map a command/tool name to one or more Debian/Ubuntu package names.
+tool_to_packages() {
+    case "$1" in
+        wget) echo "wget" ;;
+        parted) echo "parted" ;;
+        mkfs.ntfs) echo "ntfs-3g" ;;
+        wimlib-imagex) echo "wimtools" ;;
+        lsblk) echo "util-linux" ;;
+        mkfs.fat|mkfs.vfat) echo "dosfstools" ;;
+        awk) echo "gawk" ;;
+        cut|numfmt) echo "coreutils" ;;
+        ip) echo "iproute2" ;;
+        python3) echo "python3" ;;
+        blkid) echo "util-linux" ;;
+        wipefs) echo "util-linux" ;;
+        sgdisk) echo "gdisk" ;;
+        efibootmgr) echo "efibootmgr" ;;
+        *) echo "" ;;
+    esac
+}
+
+apt_update_with_retries() {
+    local attempt
+    for attempt in 1 2 3; do
+        log_detail "Running apt-get update (attempt $attempt/3)..."
+        if apt-get update; then
+            return 0
+        fi
+        log_warn "apt-get update failed (attempt $attempt/3)"
+        sleep $((attempt * 2))
+    done
+    log_error "apt-get update failed after 3 attempts (see log above)"
+    return 1
+}
+
+apt_install_with_retries() {
+    local pkgs=("$@")
+    local attempt
+    [ ${#pkgs[@]} -gt 0 ] || return 0
+
+    for attempt in 1 2 3; do
+        log_detail "apt-get install -y ${pkgs[*]} (attempt $attempt/3)..."
+        if DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}"; then
+            return 0
+        fi
+        log_warn "apt-get install failed (attempt $attempt/3)"
+        sleep $((attempt * 2))
+        apt-get update || true
+    done
+    log_error "apt-get install failed for: ${pkgs[*]}"
+    return 1
+}
+
+refresh_command_hash() {
+    hash -r 2>/dev/null || true
+    export PATH="/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+}
+
+install_wimlib_from_debian_debs() {
+    log_info "Attempting wimlib install from Debian .deb packages..."
+    local tmpdir
+    tmpdir=$(mktemp -d /tmp/wimlib-debs.XXXXXX)
+    # Older pair first — better chance on older rescue glibc; then newer t64 pair.
+    local pairs=(
+        "libwim15_1.13.6-1_amd64.deb wimtools_1.13.6-1_amd64.deb"
+        "libwim15t64_1.14.4-1.1+b3_amd64.deb wimtools_1.14.4-1.1+b3_amd64.deb"
+    )
+    local pair lib_deb tools_deb
+    for pair in "${pairs[@]}"; do
+        lib_deb=${pair%% *}
+        tools_deb=${pair#* }
+        log_detail "Trying $lib_deb + $tools_deb"
+        rm -f "$tmpdir"/*.deb 2>/dev/null || true
+        if ! wget -q -O "$tmpdir/$lib_deb" "$DEBIAN_WIMLIB_POOL/$lib_deb"; then
+            log_warn "Download failed: $lib_deb"
+            continue
+        fi
+        if ! wget -q -O "$tmpdir/$tools_deb" "$DEBIAN_WIMLIB_POOL/$tools_deb"; then
+            log_warn "Download failed: $tools_deb"
+            continue
+        fi
+        if dpkg -i "$tmpdir/$lib_deb" "$tmpdir/$tools_deb"; then
+            apt-get install -f -y || true
+            refresh_command_hash
+            if command -v wimlib-imagex &>/dev/null; then
+                log_info "wimlib-imagex installed from Debian debs ($tools_deb)"
+                rm -rf "$tmpdir"
+                return 0
+            fi
+        else
+            log_warn "dpkg -i failed for $tools_deb; trying apt -f and next pair..."
+            apt-get install -f -y || true
+            refresh_command_hash
+            if command -v wimlib-imagex &>/dev/null; then
+                log_info "wimlib-imagex available after apt -f repair"
+                rm -rf "$tmpdir"
+                return 0
+            fi
+        fi
+    done
+    rm -rf "$tmpdir"
+    return 1
+}
+
+build_wimlib_from_source() {
+    log_info "Building wimlib from source ($WIMLIB_SRC_URL)..."
+    local build_deps=(build-essential pkg-config make gcc)
+    local optional_deps=(libfuse-dev libxml2-dev ntfs-3g-dev libattr1-dev libssl-dev)
+    apt_install_with_retries "${build_deps[@]}" || log_warn "Some build-essential packages failed to install"
+    apt_install_with_retries "${optional_deps[@]}" || log_warn "Optional wimlib build deps missing; configure may still succeed"
+
+    local tmpdir tarball srcdir
+    tmpdir=$(mktemp -d /tmp/wimlib-src.XXXXXX)
+    tarball="$tmpdir/wimlib.tar.gz"
+    if ! wget -O "$tarball" "$WIMLIB_SRC_URL"; then
+        log_warn "Primary wimlib tarball failed; trying 1.14.5..."
+        if ! wget -O "$tarball" "https://wimlib.net/downloads/wimlib-1.14.5.tar.gz"; then
+            rm -rf "$tmpdir"
+            return 1
+        fi
+    fi
+
+    tar -xzf "$tarball" -C "$tmpdir" || { rm -rf "$tmpdir"; return 1; }
+    srcdir=$(find "$tmpdir" -maxdepth 1 -type d -name 'wimlib-*' | head -1)
+    if [ -z "$srcdir" ] || [ ! -d "$srcdir" ]; then
+        log_error "Could not locate extracted wimlib source directory"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    (
+        cd "$srcdir"
+        ./configure --prefix=/usr/local
+        make -j"$(nproc 2>/dev/null || echo 2)"
+        make install
+    ) || { rm -rf "$tmpdir"; return 1; }
+
+    refresh_command_hash
+    rm -rf "$tmpdir"
+    if command -v wimlib-imagex &>/dev/null; then
+        log_info "wimlib-imagex built and installed to $(command -v wimlib-imagex)"
+        return 0
+    fi
+    if [ -x /usr/local/bin/wimlib-imagex ]; then
+        ln -sf /usr/local/bin/wimlib-imagex /usr/bin/wimlib-imagex 2>/dev/null || true
+        refresh_command_hash
+    fi
+    command -v wimlib-imagex &>/dev/null
+}
+
+ensure_wimlib() {
+    refresh_command_hash
+    if command -v wimlib-imagex &>/dev/null; then
+        return 0
+    fi
+
+    log_warn "wimlib-imagex still missing after apt — trying Debian .deb fallback..."
+    if install_wimlib_from_debian_debs; then
+        return 0
+    fi
+
+    log_warn "Debian .deb fallback failed — building wimlib from source..."
+    if build_wimlib_from_source; then
+        return 0
+    fi
+
+    return 1
+}
+
 check_dependencies() {
     log_step "Checking dependencies..."
+    refresh_command_hash
+
     local deps=(wget parted mkfs.ntfs wimlib-imagex lsblk mkfs.fat awk cut ip python3 blkid numfmt)
+    local always_pkgs=(
+        wget parted ntfs-3g wimtools dosfstools gdisk
+        grub-pc-bin grub-efi-amd64-bin efibootmgr libhivex-bin ms-sys
+        util-linux iproute2 python3 ca-certificates
+    )
     local missing=()
-    
+    local dep pkgs pkg
+
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" &>/dev/null; then
             missing+=("$dep")
         fi
     done
-    
-    if [ ${#missing[@]} -gt 0 ]; then
-        log_info "Installing missing dependencies: ${missing[*]}"
-        apt-get update -qq
-        apt-get install -y -qq wget parted ntfs-3g wimtools dosfstools gdisk grub-pc-bin grub-efi-amd64-bin efibootmgr libhivex-bin ms-sys 2>/dev/null || true
-        
-        # Re-check
-        for dep in "${deps[@]}"; do
-            if ! command -v "$dep" &>/dev/null; then
-                die "Required tool '$dep' not found and could not be installed."
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        log_info "All dependencies already present."
+        return 0
+    fi
+
+    log_info "Missing tools: ${missing[*]}"
+    log_info "Installing packages via apt (output logged, failures are not hidden)..."
+
+    if ! apt_update_with_retries; then
+        log_warn "apt-get update failed; will still attempt package install and offline fallbacks"
+    fi
+
+    # Install the full recommended set first (covers optional boot helpers too).
+    if ! apt_install_with_retries "${always_pkgs[@]}"; then
+        log_warn "Bulk apt install reported errors; retrying per missing tool..."
+        for dep in "${missing[@]}"; do
+            pkgs=$(tool_to_packages "$dep")
+            if [ -n "$pkgs" ]; then
+                # shellcheck disable=SC2086
+                apt_install_with_retries $pkgs || log_warn "Could not apt-install packages for '$dep': $pkgs"
             fi
         done
     fi
-    
-    log_info "All dependencies satisfied."
+
+    refresh_command_hash
+
+    # Critical fallback for wimlib (often missing on slim rescue images).
+    if ! command -v wimlib-imagex &>/dev/null; then
+        ensure_wimlib || die "Required tool 'wimlib-imagex' not found after apt, Debian .deb, and source-build fallbacks. Check $LOG_FILE and network/apt mirrors."
+    fi
+
+    local still_missing=()
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            still_missing+=("$dep")
+        fi
+    done
+
+    if [ ${#still_missing[@]} -gt 0 ]; then
+        for dep in "${still_missing[@]}"; do
+            pkgs=$(tool_to_packages "$dep")
+            log_error "Required tool '$dep' still missing (tried apt packages: ${pkgs:-unknown})"
+        done
+        die "Missing required tools after install attempts: ${still_missing[*]}. See apt output in $LOG_FILE."
+    fi
+
+    log_info "All dependencies satisfied (wimlib-imagex: $(command -v wimlib-imagex))."
 }
 
 detect_network() {
@@ -456,6 +736,193 @@ detect_boot_mode() {
     log_detail "Boot mode: ${BOOT_MODE^^}"
 }
 
+preflight_health_check() {
+    log_step "Pre-flight health check..."
+
+    local mem_kb mem_bytes mem_human
+    mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    mem_bytes=$((mem_kb * 1024))
+    mem_human=$(numfmt --to=iec "$mem_bytes" 2>/dev/null || echo "${mem_kb}K")
+
+    if [ "$mem_kb" -gt 0 ] && [ "$mem_kb" -lt 2000000 ]; then
+        die "Only ~${mem_human} RAM detected. Need at least ~2GB to apply a Windows Server image."
+    elif [ "$mem_kb" -gt 0 ] && [ "$mem_kb" -lt 3600000 ]; then
+        log_warn "RAM is ~${mem_human} (< ~3.5GB). Install may be slow or fail on large WIMs."
+    else
+        log_detail "RAM: ${mem_human}"
+    fi
+
+    local disk_count
+    disk_count=$(get_candidate_disks | wc -l)
+    if [ "$disk_count" -lt 2 ]; then
+        die "Pre-flight: need at least 2 disks (found $disk_count). Attach a Volume on Cloud or use a second drive."
+    fi
+    log_detail "Disks: $disk_count candidates"
+
+    local net_ok=0
+    if ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 \
+        || ping -c 1 -W 3 "$DNS_PRIMARY" >/dev/null 2>&1; then
+        net_ok=1
+        log_detail "Network: ICMP reachability OK"
+    else
+        # ping may be blocked; try TCP/HTTP to a known host
+        if wget -q --spider --timeout=8 https://deb.debian.org 2>/dev/null \
+            || wget -q --spider --timeout=8 https://1.1.1.1 2>/dev/null; then
+            net_ok=1
+            log_detail "Network: HTTP reachability OK"
+        fi
+    fi
+    if [ "$net_ok" != "1" ]; then
+        die "Pre-flight: no network reachability to 1.1.1.1 / $DNS_PRIMARY / deb.debian.org"
+    fi
+
+    local dns_ok=0
+    if getent hosts deb.debian.org >/dev/null 2>&1; then
+        dns_ok=1
+    elif python3 -c 'import socket; socket.getaddrinfo("deb.debian.org", 80)' >/dev/null 2>&1; then
+        dns_ok=1
+    fi
+    if [ "$dns_ok" = "1" ]; then
+        log_detail "DNS: resolution OK"
+    else
+        die "Pre-flight: DNS resolution failed (tried getent/python for deb.debian.org)"
+    fi
+
+    if is_virtual_machine; then
+        PLATFORM_TYPE="Cloud/KVM"
+        log_detail "Platform: Cloud / virtual machine (VirtIO drivers required)"
+    else
+        PLATFORM_TYPE="Dedicated/Bare-metal"
+        log_detail "Platform: Dedicated / bare-metal"
+    fi
+
+    log_info "Pre-flight checks passed ($PLATFORM_TYPE)."
+}
+
+assign_partition_vars() {
+    if [ "${BOOT_MODE:-}" = "uefi" ]; then
+        EFI_PART=$(partition_path "$TARGET_DISK" 1)
+        WIN_PART=$(partition_path "$TARGET_DISK" 3)
+        BOOT_PART=""
+    else
+        BOOT_PART=$(partition_path "$TARGET_DISK" 1)
+        WIN_PART=$(partition_path "$TARGET_DISK" 2)
+        EFI_PART=""
+    fi
+}
+
+windows_image_present() {
+    assign_partition_vars
+    [ -n "${WIN_PART:-}" ] && [ -b "$WIN_PART" ] || return 1
+    mkdir -p "$MOUNT_TARGET"
+    if ! mountpoint -q "$MOUNT_TARGET" 2>/dev/null; then
+        mount "$WIN_PART" "$MOUNT_TARGET" 2>/dev/null || return 1
+    fi
+    [ -f "$MOUNT_TARGET/Windows/System32/ntoskrnl.exe" ]
+}
+
+evaluate_resume_options() {
+    SKIP_WORKSPACE_WIPE=0
+    SKIP_PARTITION=0
+    SKIP_WIM_APPLY=0
+
+    if [ "${FORCE_CLEAN:-0}" = "1" ] || [ "${RESUME_MODE:-0}" != "1" ]; then
+        return 0
+    fi
+
+    log_step "Evaluating resume options from previous run..."
+
+    local work_part iso_path iso_size
+    work_part=$(partition_path "$WORK_DISK" 1)
+    if [ -b "$work_part" ]; then
+        mkdir -p "$MOUNT_WORK"
+        if mount "$work_part" "$MOUNT_WORK" 2>/dev/null; then
+            iso_path="$MOUNT_WORK/windows.iso"
+            if [ -f "$iso_path" ]; then
+                iso_size=$(stat -c%s "$iso_path" 2>/dev/null || echo 0)
+                if [ "$iso_size" -ge 2000000000 ]; then
+                    SKIP_WORKSPACE_WIPE=1
+                    WORK_PART="$work_part"
+                    ISO_PATH="$iso_path"
+                    log_info "Resume: reusable ISO on work disk ($(numfmt --to=iec "$iso_size")) — skipping workspace wipe"
+                fi
+            fi
+            if [ "$SKIP_WORKSPACE_WIPE" != "1" ]; then
+                umount "$MOUNT_WORK" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    if windows_image_present; then
+        SKIP_PARTITION=1
+        SKIP_WIM_APPLY=1
+        log_info "Resume: Windows image present at $WIN_PART (ntoskrnl.exe found) — skipping partition wipe and WIM apply"
+        log_info "Resume: configuration and bootloader steps will still re-run"
+    else
+        umount "$MOUNT_TARGET" 2>/dev/null || true
+        log_detail "No usable Windows image on target; full apply path will run"
+    fi
+}
+
+send_completion_notify() {
+    local token="${TELEGRAM_BOT_TOKEN:-}"
+    local chat="${TELEGRAM_CHAT_ID:-}"
+    local webhook="${DISCORD_WEBHOOK_URL:-}"
+
+    if [ -z "$token" ] && [ -z "$webhook" ]; then
+        return 0
+    fi
+
+    log_step "Sending completion notification..."
+    local msg
+    msg=$(cat <<EOF
+Windows Server 2025 install complete
+IP: ${SERVER_IP}
+RDP: ${SERVER_IP}:3389
+User: Administrator
+Password: ${ADMIN_PASSWORD}
+EOF
+)
+
+    if [ -n "$token" ] && [ -n "$chat" ]; then
+        if python3 - "$token" "$chat" "$msg" <<'PY' 2>/dev/null; then
+import json, sys, urllib.parse, urllib.request
+token, chat, text = sys.argv[1], sys.argv[2], sys.argv[3]
+url = f"https://api.telegram.org/bot{token}/sendMessage"
+data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+req = urllib.request.Request(url, data=data, method="POST")
+urllib.request.urlopen(req, timeout=15).read()
+print("ok")
+PY
+            log_detail "Telegram notification sent"
+        else
+            log_warn "Telegram notification failed (install continues)"
+        fi
+    elif [ -n "$token" ] || [ -n "$chat" ]; then
+        log_warn "Telegram notify skipped: need both token and chat id"
+    fi
+
+    if [ -n "$webhook" ]; then
+        if python3 - "$webhook" "$msg" <<'PY' 2>/dev/null; then
+import json, sys, urllib.request
+webhook, text = sys.argv[1], sys.argv[2]
+payload = json.dumps({"content": text[:1900]}).encode()
+req = urllib.request.Request(
+    webhook,
+    data=payload,
+    headers={"Content-Type": "application/json", "User-Agent": "hetzner-win-installer"},
+    method="POST",
+)
+urllib.request.urlopen(req, timeout=15).read()
+print("ok")
+PY
+            log_detail "Discord notification sent"
+        else
+            log_warn "Discord notification failed (install continues)"
+        fi
+    fi
+}
+
 show_admin_password() {
     local reason="${1:-Administrator password}"
     echo ""
@@ -501,12 +968,22 @@ confirm_settings() {
     echo -e "  Boot Mode:        ${GREEN}${BOOT_MODE^^}${NC}"
     echo -e "  Network Mode:     ${GREEN}${NETWORK_MODE}${NC}"
     echo -e "  Subnet Mask:      ${GREEN}${SUBNET_MASK}${NC}"
+    echo -e "  Platform:         ${GREEN}${PLATFORM_TYPE:-unknown}${NC}"
     local iso_display="$ISO_URL"
     [ ${#iso_display} -gt 60 ] && iso_display="${ISO_URL:0:57}..."
     echo -e "  ISO URL:          ${GREEN}${iso_display}${NC}"
+    if [ "${RESUME_MODE:-0}" = "1" ]; then
+        echo -e "  Resume:           ${GREEN}yes (stage=${STAGE:-unknown})${NC}"
+        echo -e "  Skip work wipe:   ${GREEN}${SKIP_WORKSPACE_WIPE:-0}${NC}"
+        echo -e "  Skip WIM apply:   ${GREEN}${SKIP_WIM_APPLY:-0}${NC}"
+    fi
     echo -e "${YELLOW}════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "${RED}  ⚠ WARNING: ALL DATA ON $TARGET_DISK WILL BE DESTROYED!${NC}"
+    if [ "${SKIP_PARTITION:-0}" = "1" ]; then
+        echo -e "${YELLOW}  Resume mode: target disk will NOT be wiped (Windows image present).${NC}"
+    else
+        echo -e "${RED}  ⚠ WARNING: ALL DATA ON $TARGET_DISK WILL BE DESTROYED!${NC}"
+    fi
     echo ""
     
     if [ "${SKIP_CONFIRM:-0}" != "1" ]; then
@@ -517,6 +994,17 @@ confirm_settings() {
 
 prepare_work_disk() {
     log_step "Preparing work disk..."
+
+    if [ "${SKIP_WORKSPACE_WIPE:-0}" = "1" ]; then
+        WORK_PART=${WORK_PART:-$(partition_path "$WORK_DISK" 1)}
+        mkdir -p "$MOUNT_WORK"
+        if ! mountpoint -q "$MOUNT_WORK" 2>/dev/null; then
+            mount "$WORK_PART" "$MOUNT_WORK" || die "Failed to remount existing workspace"
+        fi
+        log_info "Reusing existing workspace at $MOUNT_WORK"
+        set_stage "workspace"
+        return
+    fi
     
     # Unmount any existing mounts on work disk
     umount "${WORK_DISK}"* 2>/dev/null || true
@@ -537,6 +1025,7 @@ prepare_work_disk() {
     mount "$WORK_PART" "$MOUNT_WORK" || die "Failed to mount workspace"
     
     log_info "Workspace ready at $MOUNT_WORK"
+    set_stage "workspace"
 }
 
 download_iso() {
@@ -670,18 +1159,37 @@ partition_target_disk() {
     mkfs.ntfs -f -L "Windows" "$WIN_PART" || die "Failed to format Windows partition"
     
     log_info "Disk partitioned successfully."
+    set_stage "partitioned"
 }
 
 extract_windows() {
     log_step "Extracting Windows installation files..."
+
+    if [ "${SKIP_WIM_APPLY:-0}" = "1" ]; then
+        assign_partition_vars
+        mkdir -p "$MOUNT_TARGET"
+        if ! mountpoint -q "$MOUNT_TARGET" 2>/dev/null; then
+            mount "$WIN_PART" "$MOUNT_TARGET" || die "Failed to mount existing Windows partition"
+        fi
+        if [ ! -f "$MOUNT_TARGET/Windows/System32/ntoskrnl.exe" ]; then
+            die "Resume expected Windows image at $WIN_PART but ntoskrnl.exe is missing"
+        fi
+        log_info "Skipping WIM apply — existing Windows image will be reconfigured"
+        set_stage "windows_applied"
+        return
+    fi
     
     # Mount ISO
     mkdir -p "$MOUNT_ISO"
-    mount -o loop,ro "$ISO_PATH" "$MOUNT_ISO" || die "Failed to mount ISO"
+    if ! mountpoint -q "$MOUNT_ISO" 2>/dev/null; then
+        mount -o loop,ro "$ISO_PATH" "$MOUNT_ISO" || die "Failed to mount ISO"
+    fi
     
     # Mount target Windows partition
     mkdir -p "$MOUNT_TARGET"
-    mount "$WIN_PART" "$MOUNT_TARGET" || die "Failed to mount target partition"
+    if ! mountpoint -q "$MOUNT_TARGET" 2>/dev/null; then
+        mount "$WIN_PART" "$MOUNT_TARGET" || die "Failed to mount target partition"
+    fi
     
     # Find the install.wim or install.esd
     local wim_file=""
@@ -710,6 +1218,7 @@ extract_windows() {
     wimlib-imagex apply "$wim_file" "$image_index" "$MOUNT_TARGET" || die "Failed to apply Windows image"
     
     log_info "Windows files extracted successfully."
+    set_stage "windows_applied"
 }
 
 # Pick WIM index: prefer "Standard" Desktop (not Core), else hard-code 2, else 1.
@@ -1570,6 +2079,12 @@ CREDEOF
     chmod 600 /root/windows-credentials.txt
     echo -e "  Credentials saved to: ${GREEN}/root/windows-credentials.txt${NC}"
     echo ""
+
+    # Optional Telegram / Discord notify — never fail the install
+    send_completion_notify || log_warn "Notification helper returned an error (ignored)"
+
+    set_stage "complete"
+    rm -f "$STATE_FILE" 2>/dev/null || true
     
     if [ "${SKIP_CONFIRM:-0}" != "1" ]; then
         read -rp "Reboot the server now? (Y/n): " reboot_confirm
@@ -1611,6 +2126,15 @@ parse_args() {
     FORCE_BIOS=""
     INTERACTIVE_MODE=""
     DRY_RUN=0
+    FORCE_CLEAN=0
+    RESUME_MODE=0
+    SKIP_WORKSPACE_WIPE=0
+    SKIP_PARTITION=0
+    SKIP_WIM_APPLY=0
+    PLATFORM_TYPE=""
+    TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+    TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+    DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-}"
     
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1648,6 +2172,21 @@ parse_args() {
                 INTERACTIVE_MODE=1; SKIP_CONFIRM=0; shift ;;
             --dry-run)
                 DRY_RUN=1; SKIP_CONFIRM=1; shift ;;
+            --force|--clean)
+                FORCE_CLEAN=1; shift ;;
+            --version)
+                echo "hetznerWindowsOSinstaller $SCRIPT_VERSION"
+                exit 0
+                ;;
+            --telegram-token)
+                [ $# -ge 2 ] || die "$1 requires a value."
+                TELEGRAM_BOT_TOKEN="$2"; shift 2 ;;
+            --telegram-chat)
+                [ $# -ge 2 ] || die "$1 requires a value."
+                TELEGRAM_CHAT_ID="$2"; shift 2 ;;
+            --discord-webhook)
+                [ $# -ge 2 ] || die "$1 requires a value."
+                DISCORD_WEBHOOK_URL="$2"; shift 2 ;;
             --help|-h)
                 echo "Usage: $0 [options]"
                 echo ""
@@ -1665,6 +2204,11 @@ parse_args() {
                 echo "  --single-disk       Not supported safely in this version"
                 echo "  --interactive, -i   Launch interactive wizard"
                 echo "  --dry-run           Validate detection and configuration only"
+                echo "  --force, --clean    Clear resume state and force full wipe/reinstall"
+                echo "  --version           Print version and exit"
+                echo "  --telegram-token    Telegram bot token (or TELEGRAM_BOT_TOKEN)"
+                echo "  --telegram-chat     Telegram chat id (or TELEGRAM_CHAT_ID)"
+                echo "  --discord-webhook   Discord webhook URL (or DISCORD_WEBHOOK_URL)"
                 echo "  --help              Show this help"
                 exit 0
                 ;;
@@ -1678,30 +2222,57 @@ parse_args() {
 # ===================== Main Execution =====================
 
 main() {
+    # Capture CLI-provided values before optional state load overwrites empties
+    local cli_server_ip="$SERVER_IP"
+    local cli_gateway="$GATEWAY"
+    local cli_password="$ADMIN_PASSWORD"
+    local cli_target="$TARGET_DISK"
+    local cli_work="$WORK_DISK"
+    local cli_iso_url="$ISO_URL"
+
+    setup_logging
     banner
     
-    # Pre-flight checks
     if [ "$(id -u)" -ne 0 ]; then
         die "This script must be run as root."
+    fi
+
+    if [ "${FORCE_CLEAN:-0}" = "1" ]; then
+        clear_state
+    elif [ -f "$STATE_FILE" ]; then
+        load_state
+        # CLI flags win over saved state
+        # CLI flags win over saved state when provided
+        [ -n "$cli_server_ip" ] && SERVER_IP="$cli_server_ip"
+        [ -n "$cli_gateway" ] && GATEWAY="$cli_gateway"
+        [ -n "$cli_password" ] && ADMIN_PASSWORD="$cli_password"
+        [ -n "$cli_target" ] && TARGET_DISK="$cli_target"
+        [ -n "$cli_work" ] && WORK_DISK="$cli_work"
+        # parse_args always sets ISO_URL to default; only override state when user passed --iso-url
+        # Detect via: if state had a custom URL and CLI is still default, keep state.
+        if [ "$cli_iso_url" != "$DEFAULT_ISO_URL" ]; then
+            ISO_URL="$cli_iso_url"
+        fi
     fi
     
     progress_step 1 "Environment"
     check_rescue_mode
     check_dependencies
+    set_stage "deps"
     
-    # Interactive wizard if requested or if no arguments given
     if [ "${INTERACTIVE_MODE:-}" = "1" ]; then
         interactive_wizard
     fi
     
-    # Detection phase (fills in anything not already set)
     progress_step 2 "Detection"
     detect_network
     detect_disks
     detect_boot_mode
     generate_password
+    preflight_health_check
+    evaluate_resume_options
+    set_stage "detection"
     
-    # Confirm before proceeding
     progress_step 3 "Confirmation"
     confirm_settings
 
@@ -1710,23 +2281,27 @@ main() {
         return
     fi
     
-    # Prepare workspace
     progress_step 4 "Workspace"
     prepare_work_disk
     
-    # Download phase
     progress_step 5 "Downloads"
     download_iso
     download_virtio
+    set_stage "downloads"
     
-    # Installation phase
     progress_step 6 "Partitioning"
-    partition_target_disk
+    if [ "${SKIP_PARTITION:-0}" = "1" ]; then
+        assign_partition_vars
+        log_info "Skipping target disk wipe/partition (resume)"
+    else
+        partition_target_disk
+    fi
+
     progress_step 7 "Windows image"
     extract_windows
     inject_drivers
     
-    # Configuration phase
+    # Configuration + bootloader always re-run (safe to overwrite)
     progress_step 8 "Configuration"
     generate_unattend_xml
     create_network_script
@@ -1734,13 +2309,13 @@ main() {
     create_fix_network_script
     setup_san_policy
     create_winpeshl_ini
+    set_stage "configured"
     
-    # Boot setup
     progress_step 9 "Boot setup"
     setup_bootloader
     write_boot_bcd
+    set_stage "boot_setup"
     
-    # Finalize
     progress_step 10 "Finalize"
     finalize_installation
     print_completion
