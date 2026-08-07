@@ -68,7 +68,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="3.7.1"
+SCRIPT_VERSION="3.7.2"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -332,14 +332,19 @@ partition_path() {
 }
 
 # Locate the NTFS workspace partition on the work disk.
-# Legacy BIOS layout may be: p1=bios_grub, p2=NTFS workspace.
+# Legacy BIOS layout: p1=bios_grub (~1MiB), p2=NTFS workspace.
 # Older/UEFI layout: p1=NTFS workspace.
+# Never return the bios_grub slice (too small for NTFS).
 find_work_partition() {
     local disk="$1"
-    local part fstype label
+    local part fstype label size
+    local min_bytes=1048576  # 1 MiB — mkfs.ntfs hard floor
+
     # Prefer labeled WORKSPACE
     while read -r part; do
         [ -b "$part" ] || continue
+        size=$(lsblk -dbno SIZE "$part" 2>/dev/null || echo 0)
+        [ "$size" -ge "$min_bytes" ] || continue
         label=$(lsblk -no LABEL "$part" 2>/dev/null | head -1 | tr -d '[:space:]')
         if [ "$label" = "WORKSPACE" ]; then
             echo "$part"
@@ -348,12 +353,13 @@ find_work_partition() {
     done < <(lsblk -lnpo NAME,TYPE "$disk" 2>/dev/null | awk '$2=="part"{print $1}')
 
     # Prefer largest NTFS partition on the disk
-    local best="" best_size=0 size
+    local best="" best_size=0
     while read -r part; do
         [ -b "$part" ] || continue
         fstype=$(lsblk -no FSTYPE "$part" 2>/dev/null | head -1 | tr -d '[:space:]')
         [ "$fstype" = "ntfs" ] || continue
         size=$(lsblk -dbno SIZE "$part" 2>/dev/null || echo 0)
+        [ "$size" -ge "$min_bytes" ] || continue
         if [ "$size" -gt "$best_size" ]; then
             best="$part"
             best_size="$size"
@@ -364,19 +370,61 @@ find_work_partition() {
         return 0
     fi
 
-    # Fresh layout hints before format: bios_grub + empty p2, or single p1
+    # Fresh layout before format: prefer largest partition >= 1MiB (skip bios_grub).
+    best=""
+    best_size=0
+    while read -r part; do
+        [ -b "$part" ] || continue
+        size=$(lsblk -dbno SIZE "$part" 2>/dev/null || echo 0)
+        [ "$size" -ge "$min_bytes" ] || continue
+        if [ "$size" -gt "$best_size" ]; then
+            best="$part"
+            best_size="$size"
+        fi
+    done < <(lsblk -lnpo NAME,TYPE "$disk" 2>/dev/null | awk '$2=="part"{print $1}')
+    if [ -n "$best" ]; then
+        echo "$best"
+        return 0
+    fi
+
+    # Last resort by number: p2 if present and large enough, else p1 if large enough
     local p1 p2
     p1=$(partition_path "$disk" 1)
     p2=$(partition_path "$disk" 2)
     if [ -b "$p2" ]; then
-        echo "$p2"
-        return 0
+        size=$(lsblk -dbno SIZE "$p2" 2>/dev/null || echo 0)
+        if [ "$size" -ge "$min_bytes" ]; then
+            echo "$p2"
+            return 0
+        fi
     fi
     if [ -b "$p1" ]; then
-        echo "$p1"
-        return 0
+        size=$(lsblk -dbno SIZE "$p1" 2>/dev/null || echo 0)
+        if [ "$size" -ge "$min_bytes" ]; then
+            echo "$p1"
+            return 0
+        fi
     fi
     return 1
+}
+
+# Wait until a block device node exists (partprobe races on Cloud).
+wait_for_block_dev() {
+    local dev="$1"
+    local parent_disk="${2:-}"
+    local tries="${3:-30}"
+    local i
+    for i in $(seq 1 "$tries"); do
+        if [ -b "$dev" ]; then
+            return 0
+        fi
+        if [ -n "$parent_disk" ] && [ -b "$parent_disk" ]; then
+            partprobe "$parent_disk" 2>/dev/null || true
+        fi
+        udevadm settle --timeout=2 2>/dev/null || true
+        sleep 0.5
+    done
+    [ -b "$dev" ]
 }
 
 banner() {
@@ -749,7 +797,8 @@ check_dependencies() {
         efibootmgr libhivex-bin python3-hivex
         util-linux iproute2 python3 ca-certificates
     )
-    local optional_pkgs=(ms-sys)
+    # ms-sys is not in Debian bookworm — never apt-install it (wastes retries).
+    local optional_pkgs=()
     local missing=()
     local dep pkgs
 
@@ -1368,14 +1417,23 @@ prepare_work_disk() {
         parted -s "$WORK_DISK" mkpart primary 1MiB 2MiB
         parted -s "$WORK_DISK" set 1 bios_grub on
         parted -s "$WORK_DISK" mkpart primary ntfs 2MiB 100%
+        # Explicit: workspace is ALWAYS partition 2 with this layout (never bios_grub p1).
+        WORK_PART=$(partition_path "$WORK_DISK" 2)
     else
         parted -s "$WORK_DISK" mkpart primary ntfs 1MiB 100%
+        WORK_PART=$(partition_path "$WORK_DISK" 1)
     fi
     partprobe "$WORK_DISK" 2>/dev/null || true
     udevadm settle --timeout=10 2>/dev/null || sleep 3
-    WORK_PART=$(find_work_partition "$WORK_DISK") || die "Could not locate workspace partition on $WORK_DISK"
+    wait_for_block_dev "$WORK_PART" "$WORK_DISK" 30 || die "Workspace partition $WORK_PART did not appear after partitioning $WORK_DISK"
+    # Guard against ever formatting bios_grub (~1MiB)
+    local work_size
+    work_size=$(lsblk -dbno SIZE "$WORK_PART" 2>/dev/null || echo 0)
+    if [ "$work_size" -lt 104857600 ]; then  # < 100 MiB is never a valid ISO workspace
+        die "Refusing to format tiny partition $WORK_PART ($(numfmt --to=iec "$work_size" 2>/dev/null || echo "$work_size")) — likely bios_grub, not workspace"
+    fi
     
-    log_detail "Formatting workspace partition: $WORK_PART"
+    log_detail "Formatting workspace partition: $WORK_PART ($(numfmt --to=iec "$work_size" 2>/dev/null || echo "$work_size"))"
     mkfs.ntfs -f -L "WORKSPACE" "$WORK_PART" || die "Failed to format workspace"
     
     mkdir -p "$MOUNT_WORK"
