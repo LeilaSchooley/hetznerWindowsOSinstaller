@@ -68,7 +68,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="3.7.0"
+SCRIPT_VERSION="3.7.1"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -2683,13 +2683,15 @@ set timeout=0
 set default=0
 
 # Guaranteed Legacy BIOS → Windows bootmgr.
-# search --file finds /bootmgr on ANY disk (fixes Cloud Volume = hd0 / sda).
+# IMPORTANT: search for /Boot/HETZNER (unique marker on System Reserved), NOT
+# bare /bootmgr or /Boot/BCD. The applied WIM also ships stale \bootmgr and
+# \Boot\BCD on the Windows volume; picking those causes 0xc000000f.
 menuentry "Windows Server 2025" {
     insmod part_msdos
     insmod ntfs
     insmod ntldr
     insmod search_fs_file
-    search --file --no-floppy --set=root /bootmgr
+    search --file --no-floppy --set=root /Boot/HETZNER
     ntldr /bootmgr
 }
 GRUBEOF
@@ -2774,7 +2776,17 @@ verify_legacy_boot_ready() {
     local errors=0
     [ -f "$boot_mount/bootmgr" ] || { log_error "Missing bootmgr on System Reserved"; errors=$((errors + 1)); }
     [ -f "$boot_mount/Boot/BCD" ] || { log_error "Missing Boot\\BCD on System Reserved"; errors=$((errors + 1)); }
+    [ -f "$boot_mount/Boot/HETZNER" ] || { log_error "Missing Boot\\HETZNER GRUB search marker"; errors=$((errors + 1)); }
     [ -f "$boot_mount/grub/grub.cfg" ] || { log_error "Missing grub.cfg on System Reserved"; errors=$((errors + 1)); }
+    if [ -f "$boot_mount/grub/grub.cfg" ] && ! grep -q 'HETZNER' "$boot_mount/grub/grub.cfg"; then
+        log_error "grub.cfg does not search /Boot/HETZNER (would hit stale WIM BCD)"
+        errors=$((errors + 1))
+    fi
+    # Stale WIM boot files on Windows volume must stay gone
+    if [ -f "$MOUNT_TARGET/Boot/BCD" ] || [ -f "$MOUNT_TARGET/bootmgr" ]; then
+        log_error "Stale bootmgr/BCD still present on Windows volume (causes 0xc000000f)"
+        errors=$((errors + 1))
+    fi
     [ -d "$boot_mount/grub/i386-pc" ] || [ -f "$boot_mount/grub/i386-pc/core.img" ] \
         || { log_error "Missing GRUB i386-pc modules on System Reserved"; errors=$((errors + 1)); }
 
@@ -2834,7 +2846,7 @@ setup_bios_boot() {
             -exec cp -r {} "$boot_mount/Boot/" \; 2>/dev/null || true
     fi
 
-    # bootmgr must live on the active/boot partition root
+    # bootmgr must live on the active/boot partition root (System Reserved only).
     if [ -f "$MOUNT_TARGET/bootmgr" ]; then
         cp "$MOUNT_TARGET/bootmgr" "$boot_mount/" || die "Failed to copy bootmgr to boot partition"
     elif [ -f "$MOUNT_TARGET/Windows/Boot/PCAT/bootmgr" ]; then
@@ -2844,17 +2856,25 @@ setup_bios_boot() {
         die "bootmgr not found in applied Windows image — BIOS boot cannot be configured"
     fi
 
-    # Also keep a copy on the Windows volume (bcdboot / recovery expect it)
-    cp "$boot_mount/bootmgr" "$MOUNT_TARGET/bootmgr" 2>/dev/null || true
+    # CRITICAL: Remove WIM-shipped bootmgr + stale Boot\BCD from the Windows
+    # volume. GRUB search --file /bootmgr previously landed here and bootmgr
+    # then loaded the stale BCD → 0xc000000f.
+    rm -f "$MOUNT_TARGET/bootmgr" \
+        "$MOUNT_TARGET/Boot/BCD" "$MOUNT_TARGET/Boot/BCD.LOG" \
+        "$MOUNT_TARGET/Boot/BCD.LOG1" "$MOUNT_TARGET/Boot/BCD.LOG2" \
+        "$MOUNT_TARGET/Boot/HETZNER" 2>/dev/null || true
     mkdir -p "$MOUNT_TARGET/Boot"
     if [ -d "$MOUNT_TARGET/Windows/Boot/PCAT" ]; then
         find "$MOUNT_TARGET/Windows/Boot/PCAT" -maxdepth 1 -type f \
-            ! -iname 'BCD' ! -iname 'BCD.*' \
+            ! -iname 'BCD' ! -iname 'BCD.*' ! -iname 'bootmgr' \
             -exec cp -n {} "$MOUNT_TARGET/Boot/" \; 2>/dev/null || true
     fi
 
     mkdir -p "$boot_mount/Boot/Fonts"
     cp "$MOUNT_TARGET/Windows/Boot/Fonts/"* "$boot_mount/Boot/Fonts/" 2>/dev/null || true
+
+    # Unique GRUB search marker — only on System Reserved
+    echo "hetzner-bios-boot" > "$boot_mount/Boot/HETZNER"
 
     if [ ! -f "$boot_mount/bootmgr" ]; then
         umount "$boot_mount" 2>/dev/null || true
@@ -2866,7 +2886,7 @@ setup_bios_boot() {
         ms-sys -n "$BOOT_PART" 2>/dev/null && log_detail "Wrote NTFS VBR boot code to $BOOT_PART" || true
     fi
 
-    # Required: GRUB → search /bootmgr → ntldr (instance / Windows disk)
+    # Required: GRUB → search /Boot/HETZNER → ntldr /bootmgr
     if ! install_grub_bios_ntldr_on_disk "$TARGET_DISK" "$boot_mount" /tmp/grub-install-bios.log; then
         umount "$boot_mount" 2>/dev/null || true
         die "GRUB ntldr install failed on $TARGET_DISK — Legacy BIOS cannot be guaranteed. See /tmp/grub-install-bios.log"
@@ -2877,7 +2897,7 @@ setup_bios_boot() {
     umount "$boot_mount"
     rmdir "$boot_mount" 2>/dev/null || true
 
-    log_info "Legacy BIOS boot configured on $TARGET_DISK (GRUB ntldr → /bootmgr)."
+    log_info "Legacy BIOS boot configured on $TARGET_DISK (GRUB → /Boot/HETZNER → bootmgr)."
 }
 
 write_boot_bcd() {
@@ -2895,10 +2915,13 @@ write_boot_bcd() {
         mkdir -p "$mount_point"
         mount "$BOOT_PART" "$mount_point"
         bcd_path="$mount_point/Boot/BCD"
+        # Purge WIM stale BCD on the Windows volume (causes 0xc000000f if bootmgr finds it).
+        rm -f "$MOUNT_TARGET/Boot/BCD" "$MOUNT_TARGET/Boot/BCD.LOG" \
+            "$MOUNT_TARGET/Boot/BCD.LOG1" "$MOUNT_TARGET/Boot/BCD.LOG2" \
+            "$MOUNT_TARGET/bootmgr" "$MOUNT_TARGET/Boot/HETZNER" 2>/dev/null || true
     fi
     
     # Remove any stale BCD that was copied from the WIM image.
-    # These contain device references to the original media and cause 0xc000000f.
     rm -f "$bcd_path" "${bcd_path}.LOG" "${bcd_path}.LOG1" "${bcd_path}.LOG2" 2>/dev/null || true
     
     # Locate the BCD-Template shipped inside the installed Windows image.
@@ -2932,9 +2955,20 @@ write_boot_bcd() {
     }
     log_detail "BCD initialized from $src_bcd"
 
-    # The BCD-Template shipped with Windows uses "locate" device entries
-    # that search all partitions for winload at boot. First-boot bcdboot
-    # then creates a permanent BCD with correct partition references.
+    if [ "$BOOT_MODE" = "bios" ]; then
+        # Ensure unique GRUB search marker co-located with good BCD + bootmgr
+        echo "hetzner-bios-boot" > "$mount_point/Boot/HETZNER"
+        [ -f "$mount_point/bootmgr" ] || die "bootmgr missing on System Reserved while writing BCD"
+        [ -f "$mount_point/Boot/HETZNER" ] || die "HETZNER boot marker missing after BCD write"
+        # Re-write grub.cfg in case boot setup order left an old search-/bootmgr config
+        if [ -d "$mount_point/grub" ]; then
+            write_grub_ntldr_cfg "$mount_point/grub/grub.cfg"
+            log_detail "Refreshed GRUB cfg to search /Boot/HETZNER (avoid stale WIM BCD)"
+        fi
+    fi
+
+    # BCD-Template uses "locate" device entries that search partitions for winload.
+    # First-boot bcdboot then writes permanent partition-specific entries.
     
     umount "$mount_point" 2>/dev/null || true
     log_info "BCD setup completed."
