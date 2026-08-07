@@ -51,8 +51,8 @@
 #   - Resume state stores /dev/disk/by-id paths so letter swaps cannot retarget disks.
 #   - Equal-size top disks refuse auto-select (require --target-disk / --work-disk).
 #   - VirtIO storage + network drivers are injected and registered boot-start (Cloud).
-#   - Cloud Legacy BIOS is fully supported via guaranteed GRUB ntldr path
-#     (GRUB on BOTH instance + Volume disks so firmware disk-0 order cannot brick boot).
+#   - Cloud Legacy BIOS: GRUB ntldr on instance + Volume, /Boot/HETZNER marker,
+#     purge stale WIM Boot\\BCD, patch BCD winload.efi→winload.exe, VirtIO CriticalDeviceDatabase.
 #   - VirtIO hive edits prefer python3-hivex (dict values); hivexsh fallback; Start=0/3
 #     acceptance is the success gate (resume-safe, no false-negative verify dies).
 #   - python3-hivex + libhivex-bin + grub-pc are installed BEFORE disk wipe on Cloud/BIOS.
@@ -68,7 +68,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="3.7.2"
+SCRIPT_VERSION="3.8.0"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -172,11 +172,12 @@ load_state() {
 
 # Logs go to stderr so command substitutions like image_index=$(select_...)
 # only capture the intended return value on stdout (not log arrows).
-log_info()    { echo -e "${GREEN}[INFO]${NC} $*" >&2; }
-log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
-log_error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-log_step()    { echo -e "${CYAN}[STEP]${NC} $*" >&2; }
-log_detail()  { echo -e "${BLUE}  →${NC} $*" >&2; }
+# IMPORTANT: never echo -e the message body — "\v" in viostor becomes a vertical tab.
+log_info()    { printf '%b[INFO]%b %s\n' "${GREEN}" "${NC}" "$*" >&2; }
+log_warn()    { printf '%b[WARN]%b %s\n' "${YELLOW}" "${NC}" "$*" >&2; }
+log_error()   { printf '%b[ERROR]%b %s\n' "${RED}" "${NC}" "$*" >&2; }
+log_step()    { printf '%b[STEP]%b %s\n' "${CYAN}" "${NC}" "$*" >&2; }
+log_detail()  { printf '%b  →%b %s\n' "${BLUE}" "${NC}" "$*" >&2; }
 
 TOTAL_STEPS=10
 
@@ -2194,6 +2195,87 @@ register_virtio_boot_services() {
         fi
         log_warn "VirtIO SYSTEM hive registration failed; relying on DriverPaths/PnP only."
     fi
+
+    # Boot-critical PCI IDs so winload loads viostor before the system volume is mounted.
+    register_virtio_critical_device_database "$have_viostor" "$have_vioscsi"
+}
+
+# Populate Control\CriticalDeviceDatabase for VirtIO block/SCSI PCI IDs (Cloud boot).
+register_virtio_critical_device_database() {
+    local have_viostor="${1:-0}" have_vioscsi="${2:-0}"
+    local hive="$MOUNT_TARGET/Windows/System32/config/SYSTEM"
+    [ -f "$hive" ] || return 0
+    python3 -c 'import hivex' >/dev/null 2>&1 || ensure_python_hivex || {
+        if is_virtual_machine; then
+            die "python3-hivex required to write VirtIO CriticalDeviceDatabase on Cloud."
+        fi
+        log_warn "Skipping CriticalDeviceDatabase (python3-hivex unavailable)"
+        return 0
+    }
+
+    log_detail "Writing VirtIO CriticalDeviceDatabase PCI boot entries..."
+    if ! python3 - "$hive" "$have_viostor" "$have_vioscsi" <<'PY'
+import sys
+import hivex
+
+hive_path, have_viostor, have_vioscsi = sys.argv[1], sys.argv[2], sys.argv[3]
+SCSI_GUID = "{4D36E97B-E325-11CE-BFC1-08002BE10318}"
+
+# Legacy + modern VirtIO blk/scsi device IDs (VEN_1AF4)
+entries = []
+if have_viostor == "1":
+    for dev in ("1001", "1042"):
+        entries.append((f"pci#ven_1af4&dev_{dev}", "viostor"))
+if have_vioscsi == "1":
+    for dev in ("1004", "1048"):
+        entries.append((f"pci#ven_1af4&dev_{dev}", "vioscsi"))
+
+if not entries:
+    sys.exit(0)
+
+h = hivex.Hivex(hive_path, write=True)
+
+def child(node, key):
+    for c in h.node_children(node):
+        if h.node_name(c) == key:
+            return c
+    return None
+
+def ensure(node, key):
+    existing = child(node, key)
+    if existing is not None:
+        return existing
+    return h.node_add_child(node, key)
+
+def u16(s):
+    return (s + "\0").encode("utf-16le")
+
+root = h.root()
+cs = child(root, "ControlSet001")
+if cs is None:
+    sys.exit(3)
+control = ensure(cs, "Control")
+cdd = ensure(control, "CriticalDeviceDatabase")
+
+for key, service in entries:
+    node = ensure(cdd, key)
+    h.node_set_values(node, [
+        {"key": "Service", "t": 1, "value": u16(service)},
+        {"key": "ClassGUID", "t": 1, "value": u16(SCSI_GUID)},
+    ])
+    print(f"OK CriticalDeviceDatabase\\{key} -> {service}")
+
+h.commit(hive_path)
+sys.exit(0)
+PY
+    then
+        log_info "VirtIO CriticalDeviceDatabase entries written."
+    else
+        if is_virtual_machine; then
+            die "Failed to write VirtIO CriticalDeviceDatabase (required on Cloud). See $LOG_FILE."
+        fi
+        log_warn "CriticalDeviceDatabase write failed (continuing on bare-metal)"
+    fi
 }
 
 generate_unattend_xml() {
@@ -3010,6 +3092,16 @@ write_boot_bcd() {
     log_detail "BCD initialized from $src_bcd"
 
     if [ "$BOOT_MODE" = "bios" ]; then
+        # BCD-Template often references winload.efi — fatal on Legacy BIOS (0xc0000001).
+        [ -f "$MOUNT_TARGET/Windows/System32/winload.exe" ] || {
+            umount "$mount_point" 2>/dev/null || true
+            die "winload.exe missing from Windows volume — image apply incomplete."
+        }
+        patch_bios_bcd_winload "$bcd_path" || {
+            umount "$mount_point" 2>/dev/null || true
+            die "Failed to patch BCD for BIOS (winload.exe). See $LOG_FILE."
+        }
+
         # Ensure unique GRUB search marker co-located with good BCD + bootmgr
         echo "hetzner-bios-boot" > "$mount_point/Boot/HETZNER"
         [ -f "$mount_point/bootmgr" ] || die "bootmgr missing on System Reserved while writing BCD"
@@ -3026,6 +3118,73 @@ write_boot_bcd() {
     
     umount "$mount_point" 2>/dev/null || true
     log_info "BCD setup completed."
+}
+
+# Patch offline BCD store for Legacy BIOS: winload.efi → winload.exe (element 0x12000002).
+# Without this, bootmgr loads the BCD then fails with 0xc0000001 on CSM/Legacy.
+patch_bios_bcd_winload() {
+    local bcd_path="$1"
+    [ -f "$bcd_path" ] || return 1
+    python3 -c 'import hivex' >/dev/null 2>&1 || ensure_python_hivex || return 1
+
+    log_detail "Patching BCD application paths for BIOS (winload.exe / winresume.exe)..."
+    python3 - "$bcd_path" <<'PY'
+import re
+import sys
+import hivex
+
+bcd_path = sys.argv[1]
+h = hivex.Hivex(bcd_path, write=True)
+
+def child(node, key):
+    for c in h.node_children(node):
+        if h.node_name(c) == key:
+            return c
+    return None
+
+def u16(s):
+    return (s + "\0").encode("utf-16le")
+
+root = h.root()
+objects = child(root, "Objects")
+if objects is None:
+    print("ERROR: BCD Objects key missing", file=sys.stderr)
+    sys.exit(2)
+
+patched = 0
+scanned = 0
+for obj in h.node_children(objects):
+    elements = child(obj, "Elements")
+    if elements is None:
+        continue
+    el = child(elements, "12000002")
+    if el is None:
+        continue
+    scanned += 1
+    try:
+        val = h.node_get_value(el, "Element")
+    except Exception:
+        continue
+    t, data = h.value_value(val)
+    try:
+        s = data.decode("utf-16le", errors="strict").rstrip("\0")
+    except Exception:
+        s = data.decode("utf-16le", errors="ignore").rstrip("\0")
+    news = re.sub(r"winload\.efi", "winload.exe", s, flags=re.IGNORECASE)
+    news = re.sub(r"winresume\.efi", "winresume.exe", news, flags=re.IGNORECASE)
+    if news != s:
+        h.node_set_values(el, [{"key": "Element", "t": 1, "value": u16(news)}])
+        patched += 1
+        print(f"OK patched: {s} -> {news}")
+
+h.commit(bcd_path)
+print(f"OK BCD path scan={scanned} patched={patched}")
+# Must have patched at least one path on Server images, OR already be .exe-only
+if scanned == 0:
+    print("ERROR: no ApplicationPath (12000002) elements in BCD", file=sys.stderr)
+    sys.exit(3)
+sys.exit(0)
+PY
 }
 
 create_winpeshl_ini() {

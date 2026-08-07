@@ -80,8 +80,8 @@ No files to download to your PC. No SCP. No uploads. Just one SSH command.
 - **Two-Disk Workflow** — Uses one disk for Windows and one disk for workspace/downloads
 - **Stable disk IDs** — Resume stores `/dev/disk/by-id` so `sda`/`sdb` letter swaps cannot retarget disks
 - **Equal-size guard** — Refuses ambiguous auto-select when top disks are the same size
-- **VirtIO boot-start** — Registers `viostor`/`vioscsi` in the offline SYSTEM hive (Cloud-safe) via `python3-hivex` (preferred) or `hivexsh`; success is `Start=0/3` present (resume-safe)
-- **UEFI preferred / Legacy guaranteed** — Auto-uses UEFI when firmware is EFI; on Legacy Cloud, installs GRUB `ntldr` on **both** instance + Volume disks so BIOS disk-0 order cannot miss Windows
+- **VirtIO boot-start** — Registers `viostor`/`vioscsi` in the offline SYSTEM hive + CriticalDeviceDatabase PCI IDs (Cloud-safe) via `python3-hivex`; success is `Start=0/3` present (resume-safe)
+- **UEFI preferred / Legacy hardened** — Auto-uses UEFI when firmware is EFI; on Legacy Cloud: GRUB `ntldr` on instance + Volume, unique `/Boot/HETZNER` marker, purge stale WIM `Boot\BCD`, patch BCD `winload.efi`→`winload.exe` (fixes `0xc000000f` / `0xc0000001`)
 - **Legacy preflight** — Requires `grub-pc` + `python3-hivex`/`hivexsh` before wiping disks; verifies bootmgr/BCD/GRUB/MBR (instance + Volume) before reboot
 - **RDP Pre-configured** — Remote Desktop enabled and firewall rules applied on first boot
 - **Built-in Network Repair** — `C:\fix-network.cmd` auto-placed on Windows drive for KVM use
@@ -166,7 +166,7 @@ bash install-windows.sh --dry-run
 
 - Attach a **Volume** as workspace (ISO download). The installer picks the **largest** disk for Windows and the **second-largest** for work — never by `sda`/`sdb` letter order.
 - VirtIO storage + network drivers are injected and registered boot-start on KVM/Cloud (`viostor` + `NetKVM` required). Optional VirtIO packages (balloon, etc.) never abort the install.
-- **UEFI preferred** in Cloud Console when available. If rescue shows Legacy/CSM, the installer auto-enables the guaranteed GRUB→`bootmgr` path (no `--bios` flag needed) and also puts GRUB on the Volume so firmware disk-0 still finds Windows.
+- **UEFI preferred** in Cloud Console when available (most reliable). If rescue shows Legacy/CSM, the installer auto-enables the hardened GRUB→`bootmgr` path (no `--bios` flag needed), patches BCD for `winload.exe`, and puts GRUB on the Volume so firmware disk-0 still finds Windows.
 - Re-run after a partial failure **without** `--force` to resume (keeps ISO/WIM when possible) and re-apply VirtIO hive + bootloader steps idempotently.
 - If the two largest disks are the same size, pass `--target-disk` / `--work-disk` (prefer `/dev/disk/by-id/...`).
 
