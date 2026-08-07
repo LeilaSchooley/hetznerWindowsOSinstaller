@@ -54,7 +54,8 @@
 #   - Cloud Legacy BIOS: GRUB ntldr on instance + Volume, /Boot/HETZNER marker,
 #     purge stale WIM Boot\\BCD, patch BCD winload.efi→winload.exe, VirtIO CriticalDeviceDatabase.
 #   - VirtIO hive edits prefer python3-hivex (dict values); hivexsh fallback; Start=0/3
-#     acceptance is the success gate (resume-safe, no false-negative verify dies).
+#     and CriticalDeviceDatabase Service presence are the success gates (resume-safe;
+#     no false-negative verify dies — never invert if ! python success/fail).
 #   - python3-hivex + libhivex-bin + grub-pc are installed BEFORE disk wipe on Cloud/BIOS.
 #   - UEFI remains preferred when available; --bios forces Legacy; --uefi forces UEFI.
 #   - Legacy BIOS uses GRUB i386-pc + ntldr /bootmgr (does not rely on NTFS VBR alone).
@@ -68,7 +69,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="3.8.0"
+SCRIPT_VERSION="3.8.1"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -2200,10 +2201,70 @@ register_virtio_boot_services() {
     register_virtio_critical_device_database "$have_viostor" "$have_vioscsi"
 }
 
+# True if CriticalDeviceDatabase PCI entries have the expected Service values.
+# Matching is done entirely in Python (key names contain # and & — never parse in bash).
+virtio_cdd_entries_present() {
+    local hive="$1" have_viostor="$2" have_vioscsi="$3"
+    python3 - "$hive" "$have_viostor" "$have_vioscsi" <<'PY' >/dev/null 2>&1
+import sys
+import hivex
+
+hive_path, have_viostor, have_vioscsi = sys.argv[1], sys.argv[2], sys.argv[3]
+want = {}
+if have_viostor == "1":
+    for dev in ("1001", "1042"):
+        want[f"pci#ven_1af4&dev_{dev}"] = "viostor"
+if have_vioscsi == "1":
+    for dev in ("1004", "1048"):
+        want[f"pci#ven_1af4&dev_{dev}"] = "vioscsi"
+if not want:
+    sys.exit(0)
+
+h = hivex.Hivex(hive_path, write=False)
+
+def child(node, key):
+    for c in h.node_children(node):
+        if h.node_name(c) == key:
+            return c
+    return None
+
+def read_sz(node, name):
+    val = h.node_get_value(node, name)
+    _t, data = h.value_value(val)
+    return data.decode("utf-16le").rstrip("\0")
+
+cs = child(h.root(), "ControlSet001")
+if cs is None:
+    sys.exit(1)
+control = child(cs, "Control")
+if control is None:
+    sys.exit(1)
+cdd = child(control, "CriticalDeviceDatabase")
+if cdd is None:
+    sys.exit(1)
+
+# Index children by exact node_name (handles # & without shell/path parsers).
+by_name = {h.node_name(c): c for c in h.node_children(cdd)}
+for key, service in want.items():
+    node = by_name.get(key)
+    if node is None:
+        sys.exit(2)
+    try:
+        got = read_sz(node, "Service")
+    except Exception:
+        sys.exit(3)
+    if got.lower() != service.lower():
+        sys.exit(4)
+sys.exit(0)
+PY
+}
+
 # Populate Control\CriticalDeviceDatabase for VirtIO block/SCSI PCI IDs (Cloud boot).
+# Success gate: expected Service values present after write (resume-safe; no false-negative die).
 register_virtio_critical_device_database() {
     local have_viostor="${1:-0}" have_vioscsi="${2:-0}"
     local hive="$MOUNT_TARGET/Windows/System32/config/SYSTEM"
+    local err rc=0
     [ -f "$hive" ] || return 0
     python3 -c 'import hivex' >/dev/null 2>&1 || ensure_python_hivex || {
         if is_virtual_machine; then
@@ -2213,10 +2274,26 @@ register_virtio_critical_device_database() {
         return 0
     }
 
+    # Nothing to write — treat as success.
+    if [ "$have_viostor" != "1" ] && [ "$have_vioscsi" != "1" ]; then
+        return 0
+    fi
+
+    # Idempotent resume: already present → done.
+    if virtio_cdd_entries_present "$hive" "$have_viostor" "$have_vioscsi"; then
+        log_info "VirtIO CriticalDeviceDatabase entries already present."
+        return 0
+    fi
+
     log_detail "Writing VirtIO CriticalDeviceDatabase PCI boot entries..."
-    if ! python3 - "$hive" "$have_viostor" "$have_vioscsi" <<'PY'
+    err=$(mktemp /tmp/virtio-cdd.XXXXXX)
+    python3 - "$hive" "$have_viostor" "$have_vioscsi" >"$err" 2>&1 <<'PY' || rc=$?
 import sys
-import hivex
+try:
+    import hivex
+except ImportError as e:
+    print("ImportError: python3-hivex not importable:", e, file=sys.stderr)
+    sys.exit(2)
 
 hive_path, have_viostor, have_vioscsi = sys.argv[1], sys.argv[2], sys.argv[3]
 SCSI_GUID = "{4D36E97B-E325-11CE-BFC1-08002BE10318}"
@@ -2253,6 +2330,7 @@ def u16(s):
 root = h.root()
 cs = child(root, "ControlSet001")
 if cs is None:
+    print("ERROR: ControlSet001 missing", file=sys.stderr)
     sys.exit(3)
 control = ensure(cs, "Control")
 cdd = ensure(control, "CriticalDeviceDatabase")
@@ -2263,19 +2341,83 @@ for key, service in entries:
         {"key": "Service", "t": 1, "value": u16(service)},
         {"key": "ClassGUID", "t": 1, "value": u16(SCSI_GUID)},
     ])
-    print(f"OK CriticalDeviceDatabase\\{key} -> {service}")
+    print(f"OK CriticalDeviceDatabase\\{key} -> {service}", flush=True)
 
-h.commit(hive_path)
+commit_err = None
+try:
+    h.commit(None)
+except Exception as e1:
+    try:
+        h.commit(hive_path)
+    except Exception as e2:
+        commit_err = f"{e1}; retry: {e2}"
+
+# Re-open and verify by exact node_name (keys contain # & — no path parsing).
+h2 = hivex.Hivex(hive_path, write=False)
+
+def child2(node, key):
+    for c in h2.node_children(node):
+        if h2.node_name(c) == key:
+            return c
+    return None
+
+cs2 = child2(h2.root(), "ControlSet001")
+if cs2 is None:
+    print("ERROR: ControlSet001 missing after commit", file=sys.stderr)
+    sys.exit(5)
+control2 = child2(cs2, "Control")
+cdd2 = child2(control2, "CriticalDeviceDatabase") if control2 is not None else None
+if cdd2 is None:
+    print("ERROR: CriticalDeviceDatabase missing after commit", file=sys.stderr)
+    sys.exit(6)
+
+by_name = {h2.node_name(c): c for c in h2.node_children(cdd2)}
+missing = []
+for key, service in entries:
+    node = by_name.get(key)
+    if node is None:
+        missing.append(key)
+        continue
+    try:
+        val = h2.node_get_value(node, "Service")
+        _t, data = h2.value_value(val)
+        got = data.decode("utf-16le").rstrip("\0")
+    except Exception as e:
+        missing.append(f"{key}({e})")
+        continue
+    if got.lower() != service.lower():
+        missing.append(f"{key}->got:{got}")
+
+if missing:
+    if commit_err:
+        print(f"ERROR: commit/verify failed: {commit_err}", file=sys.stderr)
+    print("ERROR: missing/mismatched CDD entries: " + ", ".join(missing), file=sys.stderr)
+    sys.exit(7)
+
+if commit_err:
+    print(f"WARN commit noisily failed but verify OK: {commit_err}", file=sys.stderr)
+print("OK CriticalDeviceDatabase verify")
 sys.exit(0)
 PY
-    then
-        log_info "VirtIO CriticalDeviceDatabase entries written."
-    else
-        if is_virtual_machine; then
-            die "Failed to write VirtIO CriticalDeviceDatabase (required on Cloud). See $LOG_FILE."
+    cat "$err" >&2 || true
+    rm -f "$err"
+
+    # Acceptance gate: presence of Service values wins over tool exit codes
+    # (mirrors Start=0/3 gate — avoids false-negative dies after OK writes).
+    if virtio_cdd_entries_present "$hive" "$have_viostor" "$have_vioscsi"; then
+        if [ "$rc" -ne 0 ]; then
+            log_warn "CriticalDeviceDatabase tool exit $rc but entries present — accepting"
+        else
+            log_info "VirtIO CriticalDeviceDatabase entries written."
         fi
-        log_warn "CriticalDeviceDatabase write failed (continuing on bare-metal)"
+        return 0
     fi
+
+    if is_virtual_machine; then
+        die "Failed to write VirtIO CriticalDeviceDatabase (required on Cloud). See $LOG_FILE."
+    fi
+    log_warn "CriticalDeviceDatabase write failed (continuing on bare-metal)"
+    return 0
 }
 
 generate_unattend_xml() {

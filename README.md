@@ -80,7 +80,7 @@ No files to download to your PC. No SCP. No uploads. Just one SSH command.
 - **Two-Disk Workflow** — Uses one disk for Windows and one disk for workspace/downloads
 - **Stable disk IDs** — Resume stores `/dev/disk/by-id` so `sda`/`sdb` letter swaps cannot retarget disks
 - **Equal-size guard** — Refuses ambiguous auto-select when top disks are the same size
-- **VirtIO boot-start** — Registers `viostor`/`vioscsi` in the offline SYSTEM hive + CriticalDeviceDatabase PCI IDs (Cloud-safe) via `python3-hivex`; success is `Start=0/3` present (resume-safe)
+- **VirtIO boot-start** — Registers `viostor`/`vioscsi` in the offline SYSTEM hive + CriticalDeviceDatabase PCI IDs (Cloud-safe) via `python3-hivex`; success is `Start=0/3` + CDD `Service` present (resume-safe)
 - **UEFI preferred / Legacy hardened** — Auto-uses UEFI when firmware is EFI; on Legacy Cloud: GRUB `ntldr` on instance + Volume, unique `/Boot/HETZNER` marker, purge stale WIM `Boot\BCD`, patch BCD `winload.efi`→`winload.exe` (fixes `0xc000000f` / `0xc0000001`)
 - **Legacy preflight** — Requires `grub-pc` + `python3-hivex`/`hivexsh` before wiping disks; verifies bootmgr/BCD/GRUB/MBR (instance + Volume) before reboot
 - **RDP Pre-configured** — Remote Desktop enabled and firewall rules applied on first boot
