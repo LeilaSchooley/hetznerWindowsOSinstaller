@@ -65,7 +65,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="3.6.1"
+SCRIPT_VERSION="3.6.2"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -1675,20 +1675,18 @@ EOF
         return 1
     fi
 
-    # Verify Start was written
-    local start_out
+    # Verify Start was written. lsval often prints bare "0" / "3" (not "dword:...").
+    local start_out expect_dec
     start_out=$(printf 'cd \\ControlSet001\\Services\\%s\nlsval Start\nquit\n' "$name" | hivexsh "$hive" 2>/dev/null || true)
-    if ! grep -qiE "dword:.*(0x)?0*${start_hex#0x}|${start_hex}" <<<"$start_out"; then
-        # Accept decimal equivalents too (0 / 3)
-        if [ "$start_hex" = "0x0" ] && grep -qiE 'dword:.*\b0\b' <<<"$start_out"; then
-            :
-        elif [ "$start_hex" = "0x3" ] && grep -qiE 'dword:.*\b3\b' <<<"$start_out"; then
-            :
-        else
-            log_warn "hivex: could not verify Start for $name (got: $(echo "$start_out" | tr '\n' ' '))"
-            rm -f "$tmp" "$err"
-            return 1
-        fi
+    case "$start_hex" in
+        0x0|0x00) expect_dec=0 ;;
+        0x3|0x03) expect_dec=3 ;;
+        *) expect_dec=$((start_hex)) ;;
+    esac
+    if ! printf '%s' "$start_out" | grep -qE "(^|[^0-9])${expect_dec}([^0-9]|$)"; then
+        log_warn "hivex: could not verify Start for $name (got: $(echo "$start_out" | tr '\n' ' '))"
+        rm -f "$tmp" "$err"
+        return 1
     fi
 
     if [ "$storport" = "1" ]; then
@@ -1722,7 +1720,7 @@ EOF
     return 0
 }
 
-# Python+hivex (preferred) — cleaner than hivexsh scripts.
+# Python+hivex — values must be dicts: {"key","t","value"}.
 hivex_register_driver_service_python() {
     local hive="$1" name="$2" start_int="$3" group="$4" sysfile="$5" storport="${6:-0}"
     python3 - "$hive" "$name" "$start_int" "$group" "$sysfile" "$storport" <<'PY'
@@ -1751,6 +1749,9 @@ def ensure(node, key):
 def u16(s):
     return (s + "\0").encode("utf-16le")
 
+def dword(n):
+    return int(n).to_bytes(4, "little")
+
 root = h.root()
 cs = child(root, "ControlSet001")
 if cs is None:
@@ -1762,21 +1763,28 @@ if services is None:
 svc = ensure(services, name)
 # type: 1=REG_SZ, 2=REG_EXPAND_SZ, 4=REG_DWORD
 vals = [
-    ("ErrorControl", 4, (1).to_bytes(4, "little")),
-    ("Group", 1, u16(group)),
-    ("Start", 4, start.to_bytes(4, "little")),
-    ("Type", 4, (1).to_bytes(4, "little")),
-    ("ImagePath", 2, u16("\\SystemRoot\\System32\\drivers\\" + sysfile)),
+    {"key": "ErrorControl", "t": 4, "value": dword(1)},
+    {"key": "Group", "t": 1, "value": u16(group)},
+    {"key": "Start", "t": 4, "value": dword(start)},
+    {"key": "Type", "t": 4, "value": dword(1)},
+    {"key": "ImagePath", "t": 2, "value": u16("\\SystemRoot\\System32\\drivers\\" + sysfile)},
 ]
 h.node_set_values(svc, vals)
 
 if storport == "1":
     params = ensure(svc, "Parameters")
-    h.node_set_values(params, [("BusType", 4, (1).to_bytes(4, "little"))])
+    h.node_set_values(params, [{"key": "BusType", "t": 4, "value": dword(1)}])
     pnp = ensure(params, "PnpInterface")
-    h.node_set_values(pnp, [("5", 4, (1).to_bytes(4, "little"))])
+    h.node_set_values(pnp, [{"key": "5", "t": 4, "value": dword(1)}])
 
 h.commit(hive_path)
+
+# Verify Start
+val = h.node_get_value(svc, "Start")
+t, data = h.value_value(val)
+got = int.from_bytes(data[:4], "little")
+if got != start:
+    sys.exit(5)
 sys.exit(0)
 PY
 }
