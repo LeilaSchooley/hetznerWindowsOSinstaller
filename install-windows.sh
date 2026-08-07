@@ -1072,11 +1072,7 @@ preflight_legacy_guaranteed() {
         ensure_virtio_hive_tools || die "python3-hivex or hivexsh required on Cloud Legacy BIOS for VirtIO boot-start drivers — install failed. See $LOG_FILE."
     fi
 
-    # Best-effort ms-sys (optional; not in Debian bookworm).
-    if ! command -v ms-sys &>/dev/null; then
-        apt_install_with_retries ms-sys || true
-        refresh_command_hash
-    fi
+    # ms-sys is not in Debian bookworm — do not apt-retry it (noise). GRUB path is enough.
     if command -v ms-sys &>/dev/null; then
         log_detail "ms-sys OK (optional VBR helper)"
     else
