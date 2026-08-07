@@ -53,6 +53,9 @@
 #   - VirtIO storage + network drivers are injected and registered boot-start (Cloud).
 #   - Cloud Legacy BIOS is fully supported via guaranteed GRUB ntldr path
 #     (GRUB on BOTH instance + Volume disks so firmware disk-0 order cannot brick boot).
+#   - VirtIO hive edits prefer python3-hivex (dict values); hivexsh fallback; Start=0/3
+#     acceptance is the success gate (resume-safe, no false-negative verify dies).
+#   - python3-hivex + libhivex-bin + grub-pc are installed BEFORE disk wipe on Cloud/BIOS.
 #   - UEFI remains preferred when available; --bios forces Legacy; --uefi forces UEFI.
 #   - Legacy BIOS uses GRUB i386-pc + ntldr /bootmgr (does not rely on NTFS VBR alone).
 #   - This version requires a dedicated workspace disk and does not support
@@ -65,7 +68,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="3.6.2"
+SCRIPT_VERSION="3.7.0"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -326,6 +329,54 @@ partition_path() {
     else
         echo "${disk}${num}"
     fi
+}
+
+# Locate the NTFS workspace partition on the work disk.
+# Legacy BIOS layout may be: p1=bios_grub, p2=NTFS workspace.
+# Older/UEFI layout: p1=NTFS workspace.
+find_work_partition() {
+    local disk="$1"
+    local part fstype label
+    # Prefer labeled WORKSPACE
+    while read -r part; do
+        [ -b "$part" ] || continue
+        label=$(lsblk -no LABEL "$part" 2>/dev/null | head -1 | tr -d '[:space:]')
+        if [ "$label" = "WORKSPACE" ]; then
+            echo "$part"
+            return 0
+        fi
+    done < <(lsblk -lnpo NAME,TYPE "$disk" 2>/dev/null | awk '$2=="part"{print $1}')
+
+    # Prefer largest NTFS partition on the disk
+    local best="" best_size=0 size
+    while read -r part; do
+        [ -b "$part" ] || continue
+        fstype=$(lsblk -no FSTYPE "$part" 2>/dev/null | head -1 | tr -d '[:space:]')
+        [ "$fstype" = "ntfs" ] || continue
+        size=$(lsblk -dbno SIZE "$part" 2>/dev/null || echo 0)
+        if [ "$size" -gt "$best_size" ]; then
+            best="$part"
+            best_size="$size"
+        fi
+    done < <(lsblk -lnpo NAME,TYPE "$disk" 2>/dev/null | awk '$2=="part"{print $1}')
+    if [ -n "$best" ]; then
+        echo "$best"
+        return 0
+    fi
+
+    # Fresh layout hints before format: bios_grub + empty p2, or single p1
+    local p1 p2
+    p1=$(partition_path "$disk" 1)
+    p2=$(partition_path "$disk" 2)
+    if [ -b "$p2" ]; then
+        echo "$p2"
+        return 0
+    fi
+    if [ -b "$p1" ]; then
+        echo "$p1"
+        return 0
+    fi
+    return 1
 }
 
 banner() {
@@ -609,20 +660,31 @@ ensure_wimlib() {
 }
 
 # Install each package individually so one missing name (e.g. ms-sys) cannot
-# abort the entire recommended set.
+# abort the entire recommended set. Always returns 0 — callers must re-check
+# required tools explicitly (never let an optional miss block required pkgs).
 apt_install_each() {
     local pkg
-    local failed=0
     for pkg in "$@"; do
         if dpkg -s "$pkg" >/dev/null 2>&1; then
             continue
         fi
         if ! apt_install_with_retries "$pkg"; then
-            log_warn "Optional/recommended package unavailable: $pkg"
-            failed=1
+            log_warn "Package unavailable (continuing): $pkg"
         fi
     done
-    return "$failed"
+    return 0
+}
+
+# Prevent grub-pc apt install from hanging on interactive device selection.
+preseed_grub_pc_debconf() {
+    if ! command -v debconf-set-selections &>/dev/null; then
+        return 0
+    fi
+    debconf-set-selections <<'EOF' 2>/dev/null || true
+grub-pc grub-pc/install_devices multiselect
+grub-pc grub-pc/install_devices_empty boolean true
+grub-pc grub-pc/install_devices_failed boolean true
+EOF
 }
 
 ensure_hivexsh() {
@@ -630,17 +692,48 @@ ensure_hivexsh() {
     if command -v hivexsh &>/dev/null; then
         return 0
     fi
-    log_detail "Installing libhivex-bin (needed for VirtIO SYSTEM hive registration)..."
+    log_detail "Installing libhivex-bin (VirtIO SYSTEM hive registration)..."
     apt_update_with_retries || true
     apt_install_with_retries libhivex-bin || true
     refresh_command_hash
     if command -v hivexsh &>/dev/null; then
         return 0
     fi
-    # Last resort: package may be named differently on some mirrors
     apt_install_with_retries libhivex0 libhivex-bin || true
     refresh_command_hash
     command -v hivexsh &>/dev/null
+}
+
+ensure_python_hivex() {
+    if python3 -c 'import hivex' >/dev/null 2>&1; then
+        return 0
+    fi
+    log_detail "Installing python3-hivex (preferred VirtIO SYSTEM hive editor)..."
+    apt_update_with_retries || true
+    apt_install_with_retries python3-hivex || true
+    apt_install_with_retries python3 libhivex0 || true
+    refresh_command_hash
+    python3 -c 'import hivex' >/dev/null 2>&1
+}
+
+# Install hive editors BEFORE any destructive disk work on Cloud/KVM.
+# Prefers python3-hivex; requires at least one of python3-hivex or hivexsh.
+ensure_virtio_hive_tools() {
+    local have_py=0 have_sh=0
+    ensure_python_hivex && have_py=1 || true
+    ensure_hivexsh && have_sh=1 || true
+
+    if [ "$have_py" = "1" ]; then
+        log_detail "VirtIO hive editor: python3-hivex (preferred)"
+    fi
+    if [ "$have_sh" = "1" ]; then
+        log_detail "VirtIO hive editor: hivexsh at $(command -v hivexsh)"
+    fi
+
+    if [ "$have_py" = "1" ] || [ "$have_sh" = "1" ]; then
+        return 0
+    fi
+    return 1
 }
 
 check_dependencies() {
@@ -676,8 +769,11 @@ check_dependencies() {
         log_warn "apt-get update failed; will still attempt package install and offline fallbacks"
     fi
 
+    # Avoid interactive grub-pc prompts hanging noninteractive rescue installs.
+    preseed_grub_pc_debconf
+
     # Install one-by-one so a single unavailable package cannot block hivex/grub.
-    apt_install_each "${core_pkgs[@]}" || true
+    apt_install_each "${core_pkgs[@]}"
 
     # Retry explicitly for any still-missing required tools.
     for dep in "${deps[@]}"; do
@@ -691,7 +787,7 @@ check_dependencies() {
     done
 
     # Optional BIOS helper (not in Debian bookworm — ignore failure; GRUB ntldr covers BIOS).
-    apt_install_each "${optional_pkgs[@]}" || true
+    apt_install_each "${optional_pkgs[@]}"
 
     refresh_command_hash
 
@@ -700,20 +796,25 @@ check_dependencies() {
         ensure_wimlib || die "Required tool 'wimlib-imagex' not found after apt, Debian .deb, and source-build fallbacks. Check $LOG_FILE and network/apt mirrors."
     fi
 
-    # Cloud VirtIO hive edits need hivexsh — fail early if missing.
-    if ! ensure_hivexsh; then
-        if is_virtual_machine; then
-            die "hivexsh (libhivex-bin) is required on Cloud/KVM for VirtIO boot-start registration but could not be installed."
-        fi
-        log_warn "hivexsh unavailable — VirtIO SYSTEM hive registration will be skipped on bare-metal"
+    # Cloud: hive tools + grub MUST be present before any disk wipe.
+    if is_virtual_machine; then
+        ensure_virtio_hive_tools || die "Neither python3-hivex nor hivexsh (libhivex-bin) could be installed — required on Cloud/KVM for VirtIO boot-start registration. See apt errors in $LOG_FILE."
     else
-        log_detail "hivexsh: $(command -v hivexsh)"
+        if ensure_virtio_hive_tools; then
+            :
+        else
+            log_warn "hivex tools unavailable — VirtIO SYSTEM hive registration will be skipped on bare-metal"
+        fi
     fi
 
+    preseed_grub_pc_debconf
+    if ! command -v grub-install &>/dev/null; then
+        ensure_grub_pc || true
+    fi
     if command -v grub-install &>/dev/null; then
         log_detail "grub-install: $(command -v grub-install)"
     else
-        log_warn "grub-install missing — Legacy BIOS path will be weaker (install grub-pc)"
+        log_warn "grub-install missing — Legacy BIOS path will fail preflight if BOOT_MODE=bios"
     fi
 
     if command -v ms-sys &>/dev/null; then
@@ -962,17 +1063,18 @@ preflight_legacy_guaranteed() {
 
     log_step "Legacy BIOS guaranteed-boot preflight..."
 
-    ensure_grub_pc || die "grub-install (grub-pc) is required for guaranteed Legacy BIOS boot and could not be installed."
+    preseed_grub_pc_debconf
+    ensure_grub_pc || die "grub-install (grub-pc) is required for guaranteed Legacy BIOS boot and could not be installed. See apt errors in $LOG_FILE."
     log_detail "grub-install OK: $(command -v grub-install)"
 
+    # Cloud Legacy: hive editors must exist before wipe (python3-hivex preferred).
     if is_virtual_machine; then
-        ensure_hivexsh || die "hivexsh (libhivex-bin) is required on Cloud Legacy BIOS for VirtIO boot-start drivers."
-        log_detail "hivexsh OK: $(command -v hivexsh)"
+        ensure_virtio_hive_tools || die "python3-hivex or hivexsh required on Cloud Legacy BIOS for VirtIO boot-start drivers — install failed. See $LOG_FILE."
     fi
 
     # Best-effort ms-sys (optional; not in Debian bookworm).
     if ! command -v ms-sys &>/dev/null; then
-        apt_install_with_retries ms-sys >/dev/null 2>&1 || true
+        apt_install_with_retries ms-sys || true
         refresh_command_hash
     fi
     if command -v ms-sys &>/dev/null; then
@@ -981,7 +1083,7 @@ preflight_legacy_guaranteed() {
         log_detail "ms-sys unavailable — OK, GRUB ntldr does not need it"
     fi
 
-    log_info "Legacy BIOS preflight passed (GRUB ntldr path armed)."
+    log_info "Legacy BIOS preflight passed (GRUB + VirtIO hive tools armed before wipe)."
 }
 
 preflight_health_check() {
@@ -1081,8 +1183,8 @@ evaluate_resume_options() {
     log_step "Evaluating resume options from previous run..."
 
     local work_part iso_path iso_size
-    work_part=$(partition_path "$WORK_DISK" 1)
-    if [ -b "$work_part" ]; then
+    work_part=$(find_work_partition "$WORK_DISK" 2>/dev/null || true)
+    if [ -n "$work_part" ] && [ -b "$work_part" ]; then
         mkdir -p "$MOUNT_WORK"
         if mount "$work_part" "$MOUNT_WORK" 2>/dev/null; then
             iso_path="$MOUNT_WORK/windows.iso"
@@ -1246,12 +1348,14 @@ prepare_work_disk() {
     log_step "Preparing work disk..."
 
     if [ "${SKIP_WORKSPACE_WIPE:-0}" = "1" ]; then
-        WORK_PART=${WORK_PART:-$(partition_path "$WORK_DISK" 1)}
+        if [ -z "${WORK_PART:-}" ] || [ ! -b "${WORK_PART:-}" ]; then
+            WORK_PART=$(find_work_partition "$WORK_DISK") || die "Failed to locate existing workspace partition on $WORK_DISK"
+        fi
         mkdir -p "$MOUNT_WORK"
         if ! mountpoint -q "$MOUNT_WORK" 2>/dev/null; then
-            mount "$WORK_PART" "$MOUNT_WORK" || die "Failed to remount existing workspace"
+            mount "$WORK_PART" "$MOUNT_WORK" || die "Failed to remount existing workspace ($WORK_PART)"
         fi
-        log_info "Reusing existing workspace at $MOUNT_WORK"
+        log_info "Reusing existing workspace at $MOUNT_WORK ($WORK_PART)"
         set_stage "workspace"
         return
     fi
@@ -1259,14 +1363,21 @@ prepare_work_disk() {
     # Unmount any existing mounts on work disk
     umount "${WORK_DISK}"* 2>/dev/null || true
 
-    # Wipe and format the entire work disk
+    # Wipe and format the entire work disk.
+    # On Legacy BIOS, reserve a tiny bios_grub partition so GRUB i386-pc can embed
+    # reliably on GPT (Cloud Volume often becomes BIOS hd0).
     wipefs -a "$WORK_DISK" 2>/dev/null || true
     parted -s "$WORK_DISK" mklabel gpt
-    parted -s "$WORK_DISK" mkpart primary ntfs 1MiB 100%
+    if [ "${BOOT_MODE:-}" = "bios" ]; then
+        parted -s "$WORK_DISK" mkpart primary 1MiB 2MiB
+        parted -s "$WORK_DISK" set 1 bios_grub on
+        parted -s "$WORK_DISK" mkpart primary ntfs 2MiB 100%
+    else
+        parted -s "$WORK_DISK" mkpart primary ntfs 1MiB 100%
+    fi
     partprobe "$WORK_DISK" 2>/dev/null || true
     udevadm settle --timeout=10 2>/dev/null || sleep 3
-
-    WORK_PART=$(partition_path "$WORK_DISK" 1)
+    WORK_PART=$(find_work_partition "$WORK_DISK") || die "Could not locate workspace partition on $WORK_DISK"
     
     log_detail "Formatting workspace partition: $WORK_PART"
     mkfs.ntfs -f -L "WORKSPACE" "$WORK_PART" || die "Failed to format workspace"
@@ -1569,10 +1680,12 @@ inject_drivers() {
     local copied_driver_dirs=0
     local have_viostor=0 have_vioscsi=0 have_netkvm=0
 
-    # Critical for Cloud: viostor (disk), vioscsi, NetKVM (network), plus balloon/viorng/vioserial
-    local packages=(viostor vioscsi NetKVM balloon viorng vioserial qxldod)
+    # Critical for Cloud: viostor (disk), NetKVM (network). Others are best-effort
+    # (balloon/viorng/vioserial/qxldod missing is OK and must never abort install).
+    local required_pkgs=(viostor vioscsi NetKVM)
+    local optional_pkgs=(balloon viorng vioserial qxldod)
     local pkg arch_dir
-    for pkg in "${packages[@]}"; do
+    for pkg in "${required_pkgs[@]}" "${optional_pkgs[@]}"; do
         arch_dir=""
         for candidate in \
             "$virtio_mount/$pkg/2k25/amd64" \
@@ -1587,7 +1700,9 @@ inject_drivers() {
         if [ -n "$arch_dir" ]; then
             log_detail "Copying $pkg from $arch_dir"
             # Flatten into one DriverPaths directory (PnP searches this folder)
-            cp -r "$arch_dir"/* "$driver_stage/" 2>/dev/null || log_warn "Failed to copy $pkg drivers"
+            if ! cp -r "$arch_dir"/* "$driver_stage/" 2>/dev/null; then
+                log_warn "Failed to copy $pkg drivers (continuing)"
+            fi
             cp -n "$arch_dir"/*.inf "$MOUNT_TARGET/Windows/INF/" 2>/dev/null || true
             cp -n "$arch_dir"/*.sys "$MOUNT_TARGET/Windows/System32/drivers/" 2>/dev/null || true
             cp -n "$arch_dir"/*.cat "$MOUNT_TARGET/Windows/INF/" 2>/dev/null || true
@@ -1596,6 +1711,15 @@ inject_drivers() {
                 viostor) have_viostor=1 ;;
                 vioscsi) have_vioscsi=1 ;;
                 NetKVM) have_netkvm=1 ;;
+            esac
+        else
+            case "$pkg" in
+                viostor|vioscsi|NetKVM)
+                    log_warn "VirtIO package not found in ISO: $pkg"
+                    ;;
+                *)
+                    log_detail "Optional VirtIO package not in ISO (OK): $pkg"
+                    ;;
             esac
         fi
     done
@@ -1629,24 +1753,111 @@ inject_drivers() {
     log_info "VirtIO drivers staged ($copied_driver_dirs packages) at Windows\\Drivers\\VirtIO"
 }
 
+# Read Services\<name>\Start as a decimal integer (stdout). Empty on failure.
+# Accepts bare "0"/"3", "dword:0x0", "dword:3", etc. Idempotent resume-safe.
+hivex_read_start_value() {
+    local hive="$1" name="$2"
+    local got=""
+
+    if python3 -c 'import hivex' >/dev/null 2>&1; then
+        got=$(python3 - "$hive" "$name" <<'PY' 2>/dev/null || true
+import sys
+import hivex
+hive_path, name = sys.argv[1], sys.argv[2]
+h = hivex.Hivex(hive_path, write=False)
+
+def child(node, key):
+    for c in h.node_children(node):
+        if h.node_name(c) == key:
+            return c
+    return None
+
+root = h.root()
+cs = child(root, "ControlSet001")
+services = child(cs, "Services") if cs else None
+svc = child(services, name) if services else None
+if svc is None:
+    sys.exit(1)
+try:
+    val = h.node_get_value(svc, "Start")
+except Exception:
+    sys.exit(1)
+try:
+    print(h.value_dword(val))
+except Exception:
+    _t, data = h.value_value(val)
+    print(int.from_bytes(data[:4], "little"))
+PY
+)
+        if [[ "$got" =~ ^[0-9]+$ ]]; then
+            printf '%s' "$got"
+            return 0
+        fi
+    fi
+
+    if command -v hivexsh &>/dev/null; then
+        local start_out
+        start_out=$(printf 'cd \\ControlSet001\\Services\\%s\nlsval Start\nquit\n' "$name" | hivexsh "$hive" 2>/dev/null || true)
+        # Prefer explicit dword: forms, then bare integers.
+        got=$(printf '%s\n' "$start_out" | sed -n 's/.*dword:0x\([0-9a-fA-F]\+\).*/\1/p' | head -1)
+        if [ -n "$got" ]; then
+            printf '%d' "$((16#$got))"
+            return 0
+        fi
+        got=$(printf '%s\n' "$start_out" | sed -n 's/.*dword:\([0-9]\+\).*/\1/p' | head -1)
+        if [[ "$got" =~ ^[0-9]+$ ]]; then
+            printf '%s' "$got"
+            return 0
+        fi
+        got=$(printf '%s\n' "$start_out" | grep -oE '[0-9]+' | head -1)
+        if [[ "$got" =~ ^[0-9]+$ ]]; then
+            printf '%s' "$got"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+hivex_start_matches() {
+    local hive="$1" name="$2" expect="$3"
+    local got
+    got=$(hivex_read_start_value "$hive" "$name" 2>/dev/null || true)
+    [ -n "$got" ] && [ "$got" = "$expect" ]
+}
+
 # Register one kernel driver service in an offline SYSTEM hive via hivexsh.
 # IMPORTANT hivexsh rules:
 #   - setval N replaces ALL values at the node; pass every value in one setval.
 #   - type is expandstring: (not expand:)
 #   - dword values prefer 0xNN form.
+#   - add is idempotent-safe: skip if Services\<name> already exists (resume).
 hivex_register_driver_service() {
     local hive="$1" name="$2" start_hex="$3" group="$4" sysfile="$5" storport="${6:-0}"
-    local tmp err
+    local tmp err expect_dec
     tmp=$(mktemp /tmp/virtio-svc.XXXXXX)
     err=$(mktemp /tmp/virtio-svc-err.XXXXXX)
 
-    # Ensure Services\<name> exists
+    case "$start_hex" in
+        0x0|0x00) expect_dec=0 ;;
+        0x3|0x03) expect_dec=3 ;;
+        *) expect_dec=$((start_hex)) ;;
+    esac
+
+    # Resume fast-path: already correct Start → success (still refresh ImagePath below).
+    if hivex_start_matches "$hive" "$name" "$expect_dec"; then
+        log_detail "Services\\$name already has Start=$expect_dec — refreshing values"
+    fi
+
+    # Ensure Services\<name> exists (do not fail if already present from a prior run).
     if ! printf 'cd \\ControlSet001\\Services\\%s\nquit\n' "$name" | hivexsh "$hive" >/dev/null 2>&1; then
         if ! printf 'cd \\ControlSet001\\Services\nadd %s\ncommit\nquit\n' "$name" | hivexsh -w "$hive" >"$err" 2>&1; then
-            log_warn "hivex: failed to create Services\\$name"
-            cat "$err" >&2 || true
-            rm -f "$tmp" "$err"
-            return 1
+            # Race/resume: key may have appeared; only fail if still missing.
+            if ! printf 'cd \\ControlSet001\\Services\\%s\nquit\n' "$name" | hivexsh "$hive" >/dev/null 2>&1; then
+                log_error "hivexsh: failed to create Services\\$name"
+                cat "$err" >&2 || true
+                rm -f "$tmp" "$err"
+                return 1
+            fi
         fi
     fi
 
@@ -1669,28 +1880,28 @@ quit
 EOF
 
     if ! hivexsh -w "$hive" < "$tmp" >"$err" 2>&1; then
-        log_warn "hivex: failed to set values for Services\\$name"
+        log_error "hivexsh: failed to set values for Services\\$name"
         cat "$err" >&2 || true
+        # Still accept if Start ended up correct (partial write / resume).
+        if hivex_start_matches "$hive" "$name" "$expect_dec"; then
+            log_warn "hivexsh setval errored but Start=$expect_dec is present — accepting"
+            rm -f "$tmp" "$err"
+            return 0
+        fi
         rm -f "$tmp" "$err"
         return 1
     fi
 
-    # Verify Start was written. lsval often prints bare "0" / "3" (not "dword:...").
-    local start_out expect_dec
-    start_out=$(printf 'cd \\ControlSet001\\Services\\%s\nlsval Start\nquit\n' "$name" | hivexsh "$hive" 2>/dev/null || true)
-    case "$start_hex" in
-        0x0|0x00) expect_dec=0 ;;
-        0x3|0x03) expect_dec=3 ;;
-        *) expect_dec=$((start_hex)) ;;
-    esac
-    if ! printf '%s' "$start_out" | grep -qE "(^|[^0-9])${expect_dec}([^0-9]|$)"; then
-        log_warn "hivex: could not verify Start for $name (got: $(echo "$start_out" | tr '\n' ' '))"
+    if ! hivex_start_matches "$hive" "$name" "$expect_dec"; then
+        local start_out
+        start_out=$(hivex_read_start_value "$hive" "$name" 2>/dev/null || echo "?")
+        log_error "hivexsh: Start verify failed for $name (got='$start_out', want=$expect_dec)"
         rm -f "$tmp" "$err"
         return 1
     fi
 
     if [ "$storport" = "1" ]; then
-        # Parameters + BusType + PnpInterface (best-effort, non-fatal if subkeys exist)
+        # Parameters + BusType + PnpInterface (best-effort; keys may already exist on resume)
         printf 'cd \\ControlSet001\\Services\\%s\nadd Parameters\ncommit\nquit\n' "$name" \
             | hivexsh -w "$hive" >/dev/null 2>&1 || true
         cat > "$tmp" <<EOF
@@ -1716,32 +1927,35 @@ EOF
     fi
 
     rm -f "$tmp" "$err"
-    log_detail "Registered Services\\$name (Start=$start_hex, $sysfile)"
+    log_detail "Registered Services\\$name via hivexsh (Start=$expect_dec, $sysfile)"
     return 0
 }
 
-# Python+hivex — values must be dicts: {"key","t","value"}.
+# Python+hivex — values MUST be dicts: {"key","t","value"} (tuples raise TypeError).
+# Idempotent: ensure() reuses existing service keys on resume.
 hivex_register_driver_service_python() {
     local hive="$1" name="$2" start_int="$3" group="$4" sysfile="$5" storport="${6:-0}"
-    python3 - "$hive" "$name" "$start_int" "$group" "$sysfile" "$storport" <<'PY'
+    local err rc=0
+    err=$(mktemp /tmp/virtio-py.XXXXXX)
+    python3 - "$hive" "$name" "$start_int" "$group" "$sysfile" "$storport" >"$err" 2>&1 <<'PY' || rc=$?
 import sys
 try:
     import hivex
-except ImportError:
+except ImportError as e:
+    print("ImportError: python3-hivex not importable:", e, file=sys.stderr)
     sys.exit(2)
 
 hive_path, name, start_s, group, sysfile, storport = sys.argv[1:7]
 start = int(start_s)
-h = hivex.Hivex(hive_path, write=True)
 
-def child(node, key):
+def child(h, node, key):
     for c in h.node_children(node):
         if h.node_name(c) == key:
             return c
     return None
 
-def ensure(node, key):
-    existing = child(node, key)
+def ensure(h, node, key):
+    existing = child(h, node, key)
     if existing is not None:
         return existing
     return h.node_add_child(node, key)
@@ -1752,15 +1966,26 @@ def u16(s):
 def dword(n):
     return int(n).to_bytes(4, "little")
 
+def read_start(h, svc):
+    val = h.node_get_value(svc, "Start")
+    try:
+        return h.value_dword(val)
+    except Exception:
+        _t, data = h.value_value(val)
+        return int.from_bytes(data[:4], "little")
+
+h = hivex.Hivex(hive_path, write=True)
 root = h.root()
-cs = child(root, "ControlSet001")
+cs = child(h, root, "ControlSet001")
 if cs is None:
+    print("ERROR: ControlSet001 missing in SYSTEM hive", file=sys.stderr)
     sys.exit(3)
-services = child(cs, "Services")
+services = child(h, cs, "Services")
 if services is None:
+    print("ERROR: Services key missing in SYSTEM hive", file=sys.stderr)
     sys.exit(4)
 
-svc = ensure(services, name)
+svc = ensure(h, services, name)
 # type: 1=REG_SZ, 2=REG_EXPAND_SZ, 4=REG_DWORD
 vals = [
     {"key": "ErrorControl", "t": 4, "value": dword(1)},
@@ -1772,30 +1997,50 @@ vals = [
 h.node_set_values(svc, vals)
 
 if storport == "1":
-    params = ensure(svc, "Parameters")
+    params = ensure(h, svc, "Parameters")
     h.node_set_values(params, [{"key": "BusType", "t": 4, "value": dword(1)}])
-    pnp = ensure(params, "PnpInterface")
+    pnp = ensure(h, params, "PnpInterface")
     h.node_set_values(pnp, [{"key": "5", "t": 4, "value": dword(1)}])
 
 h.commit(hive_path)
 
-# Verify Start
-val = h.node_get_value(svc, "Start")
-t, data = h.value_value(val)
-got = int.from_bytes(data[:4], "little")
+# Re-open for a clean verify (avoids stale handles after commit).
+h2 = hivex.Hivex(hive_path, write=False)
+cs2 = child(h2, h2.root(), "ControlSet001")
+svc2 = child(h2, child(h2, cs2, "Services"), name)
+got = read_start(h2, svc2)
 if got != start:
+    print(f"ERROR: Start verify failed for {name}: got={got} want={start}", file=sys.stderr)
     sys.exit(5)
+print(f"OK Services\\{name} Start={got}")
 sys.exit(0)
 PY
+    if [ "$rc" -ne 0 ]; then
+        log_error "python3-hivex failed for Services\\$name (exit $rc)"
+        cat "$err" >&2 || true
+        rm -f "$err"
+        # Accept if Start already matches (resume / false-negative verify).
+        if hivex_start_matches "$hive" "$name" "$start_int"; then
+            log_warn "python path errored but Start=$start_int is present for $name — accepting"
+            return 0
+        fi
+        return "$rc"
+    fi
+    cat "$err" >&2 || true
+    rm -f "$err"
+    log_detail "Registered Services\\$name via python3-hivex (Start=$start_int)"
+    return 0
 }
 
 # Register VirtIO kernel drivers in the offline SYSTEM hive so storage is
 # boot-critical before PnP/offlineServicing finishes (avoids INACCESSIBLE_BOOT_DEVICE).
+# Picks ONE primary backend for the whole run (python preferred). Fallback only if
+# Start is still wrong after the primary attempt — never flip-flop on false verify fails.
 register_virtio_boot_services() {
     local have_viostor="${1:-0}" have_vioscsi="${2:-0}" have_netkvm="${3:-0}"
     local hive="$MOUNT_TARGET/Windows/System32/config/SYSTEM"
     local ok=1
-    local use_python=0
+    local backend=""
 
     if [ ! -f "$hive" ]; then
         if is_virtual_machine; then
@@ -1805,40 +2050,67 @@ register_virtio_boot_services() {
         return
     fi
 
-    # Prefer python3-hivex when available; else hivexsh with corrected syntax.
+    ensure_virtio_hive_tools || true
     if python3 -c 'import hivex' >/dev/null 2>&1; then
-        use_python=1
-        log_detail "Using python3-hivex for SYSTEM hive edits"
+        backend="python"
+        log_detail "Using python3-hivex for SYSTEM hive edits (single path)"
+    elif command -v hivexsh &>/dev/null; then
+        backend="hivexsh"
+        log_detail "Using hivexsh for SYSTEM hive edits (single path)"
     else
-        apt_install_with_retries python3-hivex >/dev/null 2>&1 || true
-        if python3 -c 'import hivex' >/dev/null 2>&1; then
-            use_python=1
-            log_detail "Using python3-hivex for SYSTEM hive edits"
-        else
-            if ! ensure_hivexsh; then
-                if is_virtual_machine; then
-                    die "Neither python3-hivex nor hivexsh available; cannot register VirtIO boot drivers on Cloud."
-                fi
-                log_warn "hivex tools unavailable; skipped VirtIO service registration."
-                return
-            fi
-            log_detail "Using hivexsh for SYSTEM hive edits"
+        if is_virtual_machine; then
+            die "Neither python3-hivex nor hivexsh available; cannot register VirtIO boot drivers on Cloud. See $LOG_FILE."
         fi
+        log_warn "hivex tools unavailable; skipped VirtIO service registration."
+        return
     fi
 
     log_detail "Registering VirtIO services in offline SYSTEM hive (boot-start storage)..."
 
     register_one() {
         local name="$1" start_hex="$2" start_int="$3" group="$4" sysfile="$5" storport="$6"
-        if [ "$use_python" = "1" ]; then
+
+        # Idempotent resume: correct Start already present — refresh via primary path anyway.
+        if hivex_start_matches "$hive" "$name" "$start_int"; then
+            log_detail "Services\\$name already Start=$start_int (resume) — re-applying to refresh ImagePath"
+        fi
+
+        if [ "$backend" = "python" ]; then
             if hivex_register_driver_service_python "$hive" "$name" "$start_int" "$group" "$sysfile" "$storport"; then
-                log_detail "Registered Services\\$name via python (Start=$start_int)"
                 return 0
             fi
-            log_warn "python hivex failed for $name — trying hivexsh"
-            ensure_hivexsh || return 1
+            # Primary failed AND Start not accepted inside python helper — try hivexsh once.
+            if hivex_start_matches "$hive" "$name" "$start_int"; then
+                return 0
+            fi
+            if command -v hivexsh &>/dev/null || ensure_hivexsh; then
+                log_warn "python path left Start!=$start_int for $name — one hivexsh fallback attempt"
+                if hivex_register_driver_service "$hive" "$name" "$start_hex" "$group" "$sysfile" "$storport"; then
+                    return 0
+                fi
+            fi
+        else
+            if hivex_register_driver_service "$hive" "$name" "$start_hex" "$group" "$sysfile" "$storport"; then
+                return 0
+            fi
+            if hivex_start_matches "$hive" "$name" "$start_int"; then
+                return 0
+            fi
+            if python3 -c 'import hivex' >/dev/null 2>&1 || ensure_python_hivex; then
+                log_warn "hivexsh path left Start!=$start_int for $name — one python fallback attempt"
+                if hivex_register_driver_service_python "$hive" "$name" "$start_int" "$group" "$sysfile" "$storport"; then
+                    return 0
+                fi
+            fi
         fi
-        hivex_register_driver_service "$hive" "$name" "$start_hex" "$group" "$sysfile" "$storport"
+
+        # Final acceptance gate: correct Start means success regardless of tool noise.
+        if hivex_start_matches "$hive" "$name" "$start_int"; then
+            log_warn "Tool reported failure for $name but Start=$start_int — treating as success"
+            return 0
+        fi
+        log_error "Failed to register Services\\$name (Start want=$start_int)"
+        return 1
     }
 
     if [ "$have_viostor" = "1" ]; then
@@ -1853,11 +2125,18 @@ register_virtio_boot_services() {
 
     sync
 
+    # Cloud hard-require: viostor Start=0 must be present.
+    if is_virtual_machine && [ "$have_viostor" = "1" ]; then
+        if ! hivex_start_matches "$hive" "viostor" "0"; then
+            die "Cloud require: Services\\viostor Start=0 not set in SYSTEM hive after registration. See errors above / $LOG_FILE."
+        fi
+    fi
+
     if [ "$ok" = "1" ]; then
         log_info "VirtIO services registered in SYSTEM hive (viostor/vioscsi boot-start)."
     else
         if is_virtual_machine; then
-            die "Failed to register VirtIO services in SYSTEM hive (required on Cloud). Check hivex output above."
+            die "Failed to register VirtIO services in SYSTEM hive (required on Cloud). Check python3-hivex/hivexsh errors above and $LOG_FILE."
         fi
         log_warn "VirtIO SYSTEM hive registration failed; relying on DriverPaths/PnP only."
     fi
@@ -2383,9 +2662,17 @@ ensure_grub_pc() {
         return 0
     fi
     log_detail "Installing grub-pc for Legacy BIOS bootloader..."
-    apt_install_with_retries grub-pc grub-pc-bin grub2-common || return 1
+    preseed_grub_pc_debconf
+    apt_install_with_retries grub-pc grub-pc-bin grub2-common || {
+        log_error "apt failed installing grub-pc (see log above)"
+        return 1
+    }
     refresh_command_hash
-    command -v grub-install &>/dev/null
+    if ! command -v grub-install &>/dev/null; then
+        log_error "grub-install still missing after installing grub-pc"
+        return 1
+    fi
+    return 0
 }
 
 write_grub_ntldr_cfg() {
@@ -2447,11 +2734,16 @@ install_grub_bios_on_work_disk() {
     log_step "Installing GRUB redirect on work disk ($WORK_DISK) for BIOS disk-0 safety..."
 
     local work_part
-    work_part="${WORK_PART:-$(partition_path "$WORK_DISK" 1)}"
+    work_part="${WORK_PART:-$(find_work_partition "$WORK_DISK" 2>/dev/null || true)}"
+    if [ -z "$work_part" ] || [ ! -b "$work_part" ]; then
+        log_warn "Could not locate work-disk NTFS partition for GRUB redirect"
+        return 1
+    fi
+    WORK_PART="$work_part"
     mkdir -p "$MOUNT_WORK"
     if ! mountpoint -q "$MOUNT_WORK" 2>/dev/null; then
         mount "$work_part" "$MOUNT_WORK" 2>/dev/null || {
-            log_warn "Could not mount work disk to install GRUB redirect"
+            log_warn "Could not mount work disk ($work_part) to install GRUB redirect"
             return 1
         }
     fi
@@ -2483,6 +2775,8 @@ verify_legacy_boot_ready() {
     [ -f "$boot_mount/bootmgr" ] || { log_error "Missing bootmgr on System Reserved"; errors=$((errors + 1)); }
     [ -f "$boot_mount/Boot/BCD" ] || { log_error "Missing Boot\\BCD on System Reserved"; errors=$((errors + 1)); }
     [ -f "$boot_mount/grub/grub.cfg" ] || { log_error "Missing grub.cfg on System Reserved"; errors=$((errors + 1)); }
+    [ -d "$boot_mount/grub/i386-pc" ] || [ -f "$boot_mount/grub/i386-pc/core.img" ] \
+        || { log_error "Missing GRUB i386-pc modules on System Reserved"; errors=$((errors + 1)); }
 
     # MBR magic 0x55AA on target
     local mbr_sig
@@ -2494,9 +2788,25 @@ verify_legacy_boot_ready() {
         log_detail "Target MBR signature OK (55aa)"
     fi
 
+    # Cloud: work-disk GRUB redirect must also have a valid MBR (Volume may be BIOS hd0).
+    if is_virtual_machine && [ -n "${WORK_DISK:-}" ] && [ -b "$WORK_DISK" ]; then
+        local work_mbr
+        work_mbr=$(od -An -tx1 -N2 -j510 "$WORK_DISK" 2>/dev/null | tr -d ' \n')
+        if [ "$work_mbr" != "55aa" ]; then
+            log_error "Work disk MBR signature invalid (got '$work_mbr', want 55aa) — BIOS disk-0 redirect broken"
+            errors=$((errors + 1))
+        else
+            log_detail "Work disk MBR signature OK (55aa)"
+        fi
+        if [ -d "$MOUNT_WORK/.bios-grub/grub" ] || mountpoint -q "$MOUNT_WORK" 2>/dev/null; then
+            [ -f "$MOUNT_WORK/.bios-grub/grub/grub.cfg" ] \
+                || log_warn "Work-disk grub.cfg not visible at $MOUNT_WORK/.bios-grub/grub/grub.cfg (mount state may differ)"
+        fi
+    fi
+
     umount "$boot_mount" 2>/dev/null || true
 
-    [ "$errors" -eq 0 ] || die "Legacy BIOS boot verification failed ($errors error(s)). Not rebooting into a broken chain."
+    [ "$errors" -eq 0 ] || die "Legacy BIOS boot verification failed ($errors error(s)). Not rebooting into a broken chain. See $LOG_FILE."
     log_info "Legacy BIOS boot chain verified (bootmgr + BCD + GRUB)."
 }
 
