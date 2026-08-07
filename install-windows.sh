@@ -65,7 +65,7 @@ set -euo pipefail
 
 # ===================== Configuration Defaults =====================
 
-SCRIPT_VERSION="3.6.0"
+SCRIPT_VERSION="3.6.1"
 
 # Default ISO URL (Windows Server 2025 Evaluation — official Microsoft)
 DEFAULT_ISO_URL="https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
@@ -653,7 +653,7 @@ check_dependencies() {
     local core_pkgs=(
         wget parted ntfs-3g wimtools dosfstools gdisk
         grub-pc grub-pc-bin grub2-common grub-efi-amd64-bin
-        efibootmgr libhivex-bin
+        efibootmgr libhivex-bin python3-hivex
         util-linux iproute2 python3 ca-certificates
     )
     local optional_pkgs=(ms-sys)
@@ -1629,86 +1629,156 @@ inject_drivers() {
     log_info "VirtIO drivers staged ($copied_driver_dirs packages) at Windows\\Drivers\\VirtIO"
 }
 
-# Ensure a Services\<name> key exists (idempotent across resume re-runs).
-hivex_ensure_service_key() {
-    local hive="$1" name="$2"
-    if printf 'cd \\ControlSet001\\Services\\%s\nquit\n' "$name" | hivexsh "$hive" >/dev/null 2>&1; then
-        return 0
-    fi
-    printf 'cd \\ControlSet001\\Services\nadd %s\ncommit\nquit\n' "$name" | hivexsh -w "$hive" >/dev/null 2>&1
-}
-
-# Write common service values; Start: 0=boot, 3=demand.
-hivex_set_driver_service() {
-    local hive="$1" name="$2" start="$3" group="$4" sysfile="$5"
-    local tmp
+# Register one kernel driver service in an offline SYSTEM hive via hivexsh.
+# IMPORTANT hivexsh rules:
+#   - setval N replaces ALL values at the node; pass every value in one setval.
+#   - type is expandstring: (not expand:)
+#   - dword values prefer 0xNN form.
+hivex_register_driver_service() {
+    local hive="$1" name="$2" start_hex="$3" group="$4" sysfile="$5" storport="${6:-0}"
+    local tmp err
     tmp=$(mktemp /tmp/virtio-svc.XXXXXX)
-    {
-        echo "cd \\ControlSet001\\Services\\${name}"
-        cat <<EOF
-setval 1
+    err=$(mktemp /tmp/virtio-svc-err.XXXXXX)
+
+    # Ensure Services\<name> exists
+    if ! printf 'cd \\ControlSet001\\Services\\%s\nquit\n' "$name" | hivexsh "$hive" >/dev/null 2>&1; then
+        if ! printf 'cd \\ControlSet001\\Services\nadd %s\ncommit\nquit\n' "$name" | hivexsh -w "$hive" >"$err" 2>&1; then
+            log_warn "hivex: failed to create Services\\$name"
+            cat "$err" >&2 || true
+            rm -f "$tmp" "$err"
+            return 1
+        fi
+    fi
+
+    # One atomic setval with all service values (setval replaces the whole value set).
+    cat > "$tmp" <<EOF
+cd \\ControlSet001\\Services\\${name}
+setval 5
 ErrorControl
-dword:00000001
-setval 1
+dword:0x1
 Group
 string:${group}
-setval 1
 Start
-dword:${start}
-setval 1
+dword:${start_hex}
 Type
-dword:00000001
-setval 1
+dword:0x1
 ImagePath
-expand:\\SystemRoot\\System32\\drivers\\${sysfile}
+expandstring:\\SystemRoot\\System32\\drivers\\${sysfile}
 commit
 quit
 EOF
-    } > "$tmp"
-    hivexsh -w "$hive" < "$tmp" >/dev/null 2>&1
-    local rc=$?
-    rm -f "$tmp"
-    return $rc
-}
 
-hivex_set_storport_params() {
-    local hive="$1" name="$2"
-    local tmp
-    tmp=$(mktemp /tmp/virtio-params.XXXXXX)
-    # Best-effort: create Parameters/PnpInterface when missing, then set BusType.
-    {
-        cat <<EOF
-cd \\ControlSet001\\Services\\${name}
-add Parameters
-commit
-quit
-EOF
-    } > "$tmp"
-    hivexsh -w "$hive" < "$tmp" >/dev/null 2>&1 || true
-    {
-        cat <<EOF
+    if ! hivexsh -w "$hive" < "$tmp" >"$err" 2>&1; then
+        log_warn "hivex: failed to set values for Services\\$name"
+        cat "$err" >&2 || true
+        rm -f "$tmp" "$err"
+        return 1
+    fi
+
+    # Verify Start was written
+    local start_out
+    start_out=$(printf 'cd \\ControlSet001\\Services\\%s\nlsval Start\nquit\n' "$name" | hivexsh "$hive" 2>/dev/null || true)
+    if ! grep -qiE "dword:.*(0x)?0*${start_hex#0x}|${start_hex}" <<<"$start_out"; then
+        # Accept decimal equivalents too (0 / 3)
+        if [ "$start_hex" = "0x0" ] && grep -qiE 'dword:.*\b0\b' <<<"$start_out"; then
+            :
+        elif [ "$start_hex" = "0x3" ] && grep -qiE 'dword:.*\b3\b' <<<"$start_out"; then
+            :
+        else
+            log_warn "hivex: could not verify Start for $name (got: $(echo "$start_out" | tr '\n' ' '))"
+            rm -f "$tmp" "$err"
+            return 1
+        fi
+    fi
+
+    if [ "$storport" = "1" ]; then
+        # Parameters + BusType + PnpInterface (best-effort, non-fatal if subkeys exist)
+        printf 'cd \\ControlSet001\\Services\\%s\nadd Parameters\ncommit\nquit\n' "$name" \
+            | hivexsh -w "$hive" >/dev/null 2>&1 || true
+        cat > "$tmp" <<EOF
 cd \\ControlSet001\\Services\\${name}\\Parameters
 setval 1
 BusType
-dword:00000001
-add PnpInterface
+dword:0x1
 commit
 quit
 EOF
-    } > "$tmp"
-    hivexsh -w "$hive" < "$tmp" >/dev/null 2>&1 || true
-    {
-        cat <<EOF
+        hivexsh -w "$hive" < "$tmp" >/dev/null 2>&1 || true
+        printf 'cd \\ControlSet001\\Services\\%s\\Parameters\nadd PnpInterface\ncommit\nquit\n' "$name" \
+            | hivexsh -w "$hive" >/dev/null 2>&1 || true
+        cat > "$tmp" <<EOF
 cd \\ControlSet001\\Services\\${name}\\Parameters\\PnpInterface
 setval 1
 5
-dword:00000001
+dword:0x1
 commit
 quit
 EOF
-    } > "$tmp"
-    hivexsh -w "$hive" < "$tmp" >/dev/null 2>&1 || true
-    rm -f "$tmp"
+        hivexsh -w "$hive" < "$tmp" >/dev/null 2>&1 || true
+    fi
+
+    rm -f "$tmp" "$err"
+    log_detail "Registered Services\\$name (Start=$start_hex, $sysfile)"
+    return 0
+}
+
+# Python+hivex (preferred) — cleaner than hivexsh scripts.
+hivex_register_driver_service_python() {
+    local hive="$1" name="$2" start_int="$3" group="$4" sysfile="$5" storport="${6:-0}"
+    python3 - "$hive" "$name" "$start_int" "$group" "$sysfile" "$storport" <<'PY'
+import sys
+try:
+    import hivex
+except ImportError:
+    sys.exit(2)
+
+hive_path, name, start_s, group, sysfile, storport = sys.argv[1:7]
+start = int(start_s)
+h = hivex.Hivex(hive_path, write=True)
+
+def child(node, key):
+    for c in h.node_children(node):
+        if h.node_name(c) == key:
+            return c
+    return None
+
+def ensure(node, key):
+    existing = child(node, key)
+    if existing is not None:
+        return existing
+    return h.node_add_child(node, key)
+
+def u16(s):
+    return (s + "\0").encode("utf-16le")
+
+root = h.root()
+cs = child(root, "ControlSet001")
+if cs is None:
+    sys.exit(3)
+services = child(cs, "Services")
+if services is None:
+    sys.exit(4)
+
+svc = ensure(services, name)
+# type: 1=REG_SZ, 2=REG_EXPAND_SZ, 4=REG_DWORD
+vals = [
+    ("ErrorControl", 4, (1).to_bytes(4, "little")),
+    ("Group", 1, u16(group)),
+    ("Start", 4, start.to_bytes(4, "little")),
+    ("Type", 4, (1).to_bytes(4, "little")),
+    ("ImagePath", 2, u16("\\SystemRoot\\System32\\drivers\\" + sysfile)),
+]
+h.node_set_values(svc, vals)
+
+if storport == "1":
+    params = ensure(svc, "Parameters")
+    h.node_set_values(params, [("BusType", 4, (1).to_bytes(4, "little"))])
+    pnp = ensure(params, "PnpInterface")
+    h.node_set_values(pnp, [("5", 4, (1).to_bytes(4, "little"))])
+
+h.commit(hive_path)
+sys.exit(0)
+PY
 }
 
 # Register VirtIO kernel drivers in the offline SYSTEM hive so storage is
@@ -1717,6 +1787,7 @@ register_virtio_boot_services() {
     local have_viostor="${1:-0}" have_vioscsi="${2:-0}" have_netkvm="${3:-0}"
     local hive="$MOUNT_TARGET/Windows/System32/config/SYSTEM"
     local ok=1
+    local use_python=0
 
     if [ ! -f "$hive" ]; then
         if is_virtual_machine; then
@@ -1726,36 +1797,59 @@ register_virtio_boot_services() {
         return
     fi
 
-    if ! ensure_hivexsh; then
-        if is_virtual_machine; then
-            die "hivexsh not available; cannot register VirtIO boot drivers on Cloud. Install libhivex-bin and re-run with --force."
+    # Prefer python3-hivex when available; else hivexsh with corrected syntax.
+    if python3 -c 'import hivex' >/dev/null 2>&1; then
+        use_python=1
+        log_detail "Using python3-hivex for SYSTEM hive edits"
+    else
+        apt_install_with_retries python3-hivex >/dev/null 2>&1 || true
+        if python3 -c 'import hivex' >/dev/null 2>&1; then
+            use_python=1
+            log_detail "Using python3-hivex for SYSTEM hive edits"
+        else
+            if ! ensure_hivexsh; then
+                if is_virtual_machine; then
+                    die "Neither python3-hivex nor hivexsh available; cannot register VirtIO boot drivers on Cloud."
+                fi
+                log_warn "hivex tools unavailable; skipped VirtIO service registration."
+                return
+            fi
+            log_detail "Using hivexsh for SYSTEM hive edits"
         fi
-        log_warn "hivexsh not available; skipped VirtIO service registration."
-        return
     fi
 
     log_detail "Registering VirtIO services in offline SYSTEM hive (boot-start storage)..."
 
+    register_one() {
+        local name="$1" start_hex="$2" start_int="$3" group="$4" sysfile="$5" storport="$6"
+        if [ "$use_python" = "1" ]; then
+            if hivex_register_driver_service_python "$hive" "$name" "$start_int" "$group" "$sysfile" "$storport"; then
+                log_detail "Registered Services\\$name via python (Start=$start_int)"
+                return 0
+            fi
+            log_warn "python hivex failed for $name — trying hivexsh"
+            ensure_hivexsh || return 1
+        fi
+        hivex_register_driver_service "$hive" "$name" "$start_hex" "$group" "$sysfile" "$storport"
+    }
+
     if [ "$have_viostor" = "1" ]; then
-        hivex_ensure_service_key "$hive" "viostor" || ok=0
-        hivex_set_driver_service "$hive" "viostor" "00000000" "SCSI miniport" "viostor.sys" || ok=0
-        hivex_set_storport_params "$hive" "viostor"
+        register_one "viostor" "0x0" "0" "SCSI miniport" "viostor.sys" "1" || ok=0
     fi
     if [ "$have_vioscsi" = "1" ]; then
-        hivex_ensure_service_key "$hive" "vioscsi" || ok=0
-        hivex_set_driver_service "$hive" "vioscsi" "00000000" "SCSI miniport" "vioscsi.sys" || ok=0
-        hivex_set_storport_params "$hive" "vioscsi"
+        register_one "vioscsi" "0x0" "0" "SCSI miniport" "vioscsi.sys" "1" || ok=0
     fi
     if [ "$have_netkvm" = "1" ]; then
-        hivex_ensure_service_key "$hive" "netkvm" || ok=0
-        hivex_set_driver_service "$hive" "netkvm" "00000003" "NDIS" "netkvm.sys" || ok=0
+        register_one "netkvm" "0x3" "3" "NDIS" "netkvm.sys" "0" || ok=0
     fi
+
+    sync
 
     if [ "$ok" = "1" ]; then
         log_info "VirtIO services registered in SYSTEM hive (viostor/vioscsi boot-start)."
     else
         if is_virtual_machine; then
-            die "Failed to register VirtIO services in SYSTEM hive (required on Cloud)."
+            die "Failed to register VirtIO services in SYSTEM hive (required on Cloud). Check hivex output above."
         fi
         log_warn "VirtIO SYSTEM hive registration failed; relying on DriverPaths/PnP only."
     fi
